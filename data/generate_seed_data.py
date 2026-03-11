@@ -1,25 +1,31 @@
 """
-Sprint 02 — Generate 2000 realistic customer feedback records using Gemini Flash.
+Sprint 02 — Generate 2000 realistic customer feedback records using Gemini 2.5 Flash Lite.
+
+Uses the Google Gen AI SDK (google-genai) with Vertex AI backend.
+Model: gemini-2.5-flash-lite (cheapest, perfect for bulk structured text gen).
 
 Outputs: data/seed_feedback.csv
 Upload to: gs://feedback-intel-raw-data/seed_feedback.csv
 
-Cost estimate: ~40 Gemini Flash calls x 50 records each ≈ $0.50-1.00
+Cost estimate: ~40 calls x 50 records ≈ $0.10-0.30 (Flash Lite is dirt cheap)
 """
 
-import vertexai
-from vertexai.generative_models import GenerativeModel
-import json, csv, uuid, time, sys
+from google import genai
+from google.genai import types
+import json, csv, uuid, time, sys, os
 from datetime import datetime, timedelta
 import random
 
 # ── Config ───────────────────────────────────────────────────────────
 PROJECT_ID = "feedback-intel-demo"
 LOCATION = "europe-west1"
-MODEL_NAME = "gemini-2.0-flash-001"
+MODEL_NAME = "gemini-2.5-flash-lite"
 BATCH_SIZE = 50
 NUM_BATCHES = 40  # 40 x 50 = 2000 records
-OUTPUT_FILE = "data/seed_feedback.csv"
+
+# Resolve paths relative to this script's location (works from any CWD)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_FILE = os.path.join(SCRIPT_DIR, "seed_feedback.csv")
 
 # ── Prompt ───────────────────────────────────────────────────────────
 PROMPT = """Generate {n} realistic customer feedback entries for a SaaS platform that sells project management and collaboration software.
@@ -49,11 +55,15 @@ IMPORTANT: Each entry must feel like it was written by a different person with d
 Return ONLY a valid JSON array. No markdown, no explanation, no code fences."""
 
 
-def generate_batch(model, batch_num, n=BATCH_SIZE):
+def generate_batch(client, batch_num, n=BATCH_SIZE):
     """Generate a single batch of feedback records via Gemini."""
-    response = model.generate_content(
-        PROMPT.format(n=n),
-        generation_config={"temperature": 1.0, "max_output_tokens": 8192},
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=PROMPT.format(n=n),
+        config=types.GenerateContentConfig(
+            temperature=1.0,
+            max_output_tokens=8192,
+        ),
     )
     text = response.text.strip()
 
@@ -82,27 +92,26 @@ def generate_batch(model, batch_num, n=BATCH_SIZE):
 
 
 def main():
-    print(f"=== Seed Data Generator ===")
+    print("=== Seed Data Generator ===")
     print(f"Target: {NUM_BATCHES * BATCH_SIZE} records in {NUM_BATCHES} batches")
     print(f"Model: {MODEL_NAME} @ {LOCATION}")
     print(f"Output: {OUTPUT_FILE}")
     print()
 
-    vertexai.init(project=PROJECT_ID, location=LOCATION)
-    model = GenerativeModel(MODEL_NAME)
+    client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
 
     all_records = []
     failed_batches = 0
 
     for i in range(NUM_BATCHES):
         try:
-            batch = generate_batch(model, i + 1)
+            batch = generate_batch(client, i + 1)
 
             if not batch:
                 failed_batches += 1
                 print(f"  Batch {i+1}/{NUM_BATCHES} — EMPTY (will retry)")
                 time.sleep(2)
-                batch = generate_batch(model, i + 1)  # one retry
+                batch = generate_batch(client, i + 1)  # one retry
 
             # Add ID and timestamp to each record
             for record in batch:
@@ -136,8 +145,8 @@ def main():
     print(f"Total records: {len(all_records)}")
     print(f"Failed batches: {failed_batches}")
 
-    # Source distribution
     from collections import Counter
+
     source_counts = Counter(r["source"] for r in all_records)
     print(f"Distribution: {dict(source_counts)}")
     print(f"Output: {OUTPUT_FILE}")

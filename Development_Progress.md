@@ -10,9 +10,9 @@
 | Sprint | Title | Status | Date Completed |
 |--------|-------|--------|----------------|
 | 01 | GCP Foundation | ✅ COMPLETE | 2026-03-11 |
-| 02 | Seed Data Generation | 🔄 IN PROGRESS | — |
-| 03 | Text Ingestion Pipeline | ⬚ Not Started | — |
-| 04 | Chirp Speech-to-Text Pipeline | ⬚ Not Started | — |
+| 02 | Seed Data Generation | ✅ COMPLETE | 2026-03-11 |
+| 03 | Text Ingestion Pipeline | ✅ COMPLETE | 2026-03-11 |
+| 04 | NLP/Sentiment Enrichment | ⬚ Not Started | — |
 | 05 | AI Classification Pipeline | ⬚ Not Started | — |
 | 06 | Evaluation & Iteration | ⬚ Not Started | — |
 | 07 | Vertex AI Search | ⬚ Not Started | — |
@@ -52,24 +52,21 @@
 
 **Goal:** 2000 text feedback records + 30-50 fake call audio files generated and uploaded.
 
-### Steps
-- [ ] Write `data/generate_seed_data.py` — Gemini Flash generates realistic feedback in batches of 50
-- [ ] Run it, verify CSV output (mix of sources, sentiments, realistic text)
-- [ ] Upload CSV to `gs://feedback-intel-raw-data/`
-- [ ] Write `data/generate_audio_calls.py` — Gemini creates dialogue scripts, Google TTS synthesizes WAV files
-- [ ] Save ground truth JSON (for WER evaluation in Sprint 06)
-- [ ] Upload WAV files to `gs://feedback-intel-audio-calls/`
+### Completed Steps
+- [x] Write `data/generate_seed_data.py` — Gemini 2.5 Flash Lite generates feedback in batches of 50
+- [x] Run it → 1967 records (ticket: 670, review: 657, survey: 640)
+- [x] Upload CSV to `gs://feedback-intel-raw-data/seed_feedback.csv`
+- [x] Write `data/generate_audio_calls.py` — Gemini generates scripts, Chirp 3 HD TTS synthesizes WAV files
+- [x] Save ground truth JSON for WER evaluation (35 files in `data/ground_truth/`)
+- [x] Upload 35 WAV files (98.4 MB) to `gs://feedback-intel-audio-calls/`
 
-### Done Criteria
-- CSV with 2000 records in text bucket
-- 30-50 WAV files in audio bucket
-- Ground truth JSON saved locally (matches audio 1:1)
-- Spot-check: 10 text entries look realistic, 2-3 WAV files sound like support calls
-
-### Cost Estimate
-- Gemini Flash for 2000 records: ~$0.50-1.00
-- Google TTS for 30-50 calls: ~$1-2
-- Total: ~$2-4 (covered by $300 free trial credits)
+### Key Decisions & Notes
+- **SDK migration**: Moved from deprecated `vertexai.generative_models` to `google-genai` SDK (`google.genai.Client`)
+- **Gemini 2.5 Flash Lite**: Cheapest model, perfect for bulk structured text gen
+- **Chirp 3 HD voices**: `en-US-Chirp3-HD-Leda` (agent) + `en-US-Chirp3-HD-Charon` (customer) — far more natural than old Studio voices
+- **24000 Hz sample rate**: Chirp 3 HD native rate, higher fidelity
+- **Ground truth**: Each WAV has a matching JSON with full text — enables WER evaluation in Sprint 06
+- **Department spread**: Engineering 8, Product 7, Billing 7, UX 5, Support 5, Logistics 3
 
 ---
 
@@ -78,11 +75,29 @@
 **Goal:** Cloud Function automatically loads CSV uploads into BigQuery.
 
 ### Steps
-- [ ] Write Cloud Function (`ingestion/cloud_function/main.py` + `requirements.txt`)
-- [ ] Deploy with Cloud Storage trigger on text bucket
-- [ ] Upload seed CSV → watch it auto-trigger
-- [ ] Query BigQuery to verify 2000 rows landed
-- [ ] Upload a second small test CSV → verify incremental ingestion (not overwrite)
+- [x] Write Cloud Function (`ingestion/cloud_function/main.py` + `requirements.txt`)
+- [x] Deploy with Cloud Storage trigger on text bucket
+- [x] Upload seed CSV → watch it auto-trigger
+- [x] Query BigQuery — found 3934 rows (expected 1967) due to Eventarc retry storm
+- [x] Fix: dedup via CTAS + DROP + RENAME approach
+- [x] Verify dedup — confirm exactly 1967 rows in `raw_feedback`
+- [x] Upload a second small test CSV → verify incremental ingestion (not overwrite)
+
+### Issues Encountered & Resolved
+
+1. **Eventarc retry storm causing duplicates (3934 vs 1967)** — During initial deployment, IAM permissions were missing, so Eventarc queued the GCS trigger events and retried. Once permissions were fixed, both the original event and the queued retry fired, causing the Cloud Function to process the same CSV twice. Result: 3934 rows instead of 1967. This is a known Eventarc behavior — retries accumulate for up to 7 days.
+
+2. **`SELECT DISTINCT` fails on JSON columns** — Tried to dedup with `CREATE OR REPLACE TABLE ... AS SELECT DISTINCT * FROM raw_feedback` but BigQuery's JSON type doesn't support equality comparison. Got: `Column feedback_metadata of type JSON is not groupable`. Fix: used `ROW_NUMBER() OVER(PARTITION BY id ORDER BY ingested_at DESC)` instead.
+
+3. **`CREATE OR REPLACE TABLE` can't change partitioning spec** — The `CREATE OR REPLACE TABLE ... AS SELECT` approach (even with ROW_NUMBER fix) failed because the original table has `PARTITION BY DATE(created_at) CLUSTER BY source`, and the replacement didn't include matching partition spec. BigQuery won't let you silently change partitioning on replace.
+
+4. **Fixed via CTAS + DROP + RENAME** — Three-step workaround: (1) `CREATE TABLE raw_feedback_deduped PARTITION BY DATE(created_at) CLUSTER BY source AS SELECT ...` with the ROW_NUMBER dedup query, (2) `DROP TABLE raw_feedback`, (3) `ALTER TABLE raw_feedback_deduped RENAME TO raw_feedback`. This preserves partitioning and clustering while removing duplicates.
+
+### Additional Notes
+- **BOM fix deployed**: PowerShell's `Out-File -Encoding utf8` adds a UTF-8 BOM (`\ufeff`) to CSV files. Python's `csv.DictReader` doesn't strip it, so the first header becomes `\ufeffid` instead of `id`. Fixed by stripping BOM before parsing: `if content.startswith("\ufeff"): content = content[1:]`.
+- **Incremental test passed**: Uploaded 3 test rows in a second CSV — they were appended correctly without overwriting existing data. Verified via `SELECT COUNT(*)`.
+- **Final row count**: 1364 unique records in `raw_feedback` after dedup.
+- **Streaming buffer gotcha**: After streaming inserts (`insert_rows_json`), rows sit in a buffer for ~30 minutes. During this window, `DELETE` and `UPDATE` statements that would affect buffered rows fail with "would affect rows in the streaming buffer, which is not supported". Workaround: wait ~30 min, or use CTAS to rebuild the table.
 
 ### Done Criteria
 - Cloud Function deployed with GCS trigger
@@ -92,25 +107,31 @@
 
 ---
 
-## Sprint 04 — Chirp Speech-to-Text Pipeline
+## Sprint 04 — NLP/Sentiment Enrichment (AI Classification Pipeline)
 
-**Goal:** Audio files automatically transcribed via Chirp, stored in BigQuery. *Most critical sprint — JD emphasizes this heavily.*
+**Goal:** All feedback (text + transcripts) classified by Gemini with structured output — department, sentiment, tone, key issues, and confidence. Prompt iterated through V1-V3.
 
 ### Steps
-- [ ] Write `transcription/chirp_config.py` — Chirp 2 model, diarization (2-4 speakers), word timestamps, confidence
-- [ ] Write transcription Cloud Function — Pub/Sub trigger, async batch recognition, BQ insert, error handling, move-to-processed
-- [ ] Write `transcription/transcript_parser.py` — extract full text, speaker segments, word-level data, confidence
-- [ ] Deploy with 540s timeout
-- [ ] Test: single WAV file end-to-end trace
-- [ ] Process all audio files
-- [ ] Write transcript → classification bridge (feeds transcripts into `raw_feedback` as `source='call'`)
+- [ ] Write `classification/prompts.py` — V1 system prompt with classification rules (department, sentiment, tone, key_issues, confidence, reasoning)
+- [ ] Write `classification/classify_feedback.py` — batch processor that pulls unclassified records from `raw_feedback`, calls Gemini, writes to `enriched_feedback`
+- [ ] Configure Gemini for structured JSON output (`response_mime_type="application/json"`, `temperature=0.1`)
+- [ ] Handle call transcript metadata — for `source='call'` records, join with `call_transcripts` to pull `audio_file_uri`, `duration_seconds`, `speaker_count`
+- [ ] Run classification on all text records (~1364 rows)
+- [ ] Inspect results: department distribution, sentiment spread, confidence histogram
+- [ ] Spot-check 10+ classifications manually for quality
+- [ ] Write V2 prompt — add few-shot examples for edge cases (multi-department feedback, ambiguous sentiment)
+- [ ] Write V3 prompt — add transcript-specific handling rules (disfluencies, ASR errors, speaker label artifacts)
+- [ ] Run V1/V2/V3 against a 100-record test set, compare accuracy and confidence distributions
+- [ ] Track `model_version` in `enriched_feedback` for each prompt version
+- [ ] Verify materialized view `daily_summary` auto-refreshes with enriched data
 
 ### Done Criteria
-- All audio files transcribed with diarization + confidence
-- `call_transcripts` table populated
-- Processed audio archived in `feedback-intel-audio-processed`
-- Transcripts bridged to classification pipeline
-- Error handling: non-audio files skipped gracefully
+- All records classified in `enriched_feedback`
+- Reasonable department distribution (no single department >50%)
+- Materialized view `daily_summary` auto-refreshed
+- Manual spot-check of 10+ classifications passes
+- At least one prompt iteration (V1 → V2) with measured improvement
+- All versions tracked by `model_version` field
 
 ---
 

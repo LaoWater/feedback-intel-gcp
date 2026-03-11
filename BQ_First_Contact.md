@@ -145,6 +145,15 @@ This is the principle of least privilege. The SA can't create new projects, can'
 
 ---
 
+
+
+
+
+
+
+
+
+
 ## 7. Step 4 — BigQuery Dataset
 
 ```powershell
@@ -324,6 +333,9 @@ You should see your test row with an auto-populated `ingested_at` timestamp.
 | `\dt` | `bq ls dataset` | List tables |
 | `pg_dump` | `bq extract` to GCS | Export to CSV/JSON/Avro/Parquet |
 | `psql` | `bq query` or Console UI | No persistent connection — each query is a job |
+| `ROW_NUMBER() OVER(...)` | `ROW_NUMBER() OVER(PARTITION BY col ORDER BY col2)` | Window function for deduplication — works where `DISTINCT` fails (e.g., JSON columns) |
+| `ALTER TABLE ... RENAME TO` | `ALTER TABLE dataset.table RENAME TO new_name` | Rename table within same dataset. Used in CTAS-then-swap dedup pattern |
+| `CREATE TABLE ... AS SELECT` | `CREATE TABLE t PARTITION BY ... CLUSTER BY ... AS SELECT ...` | CTAS with partitioning spec. BQ requires partition/cluster at creation time |
 
 ---
 
@@ -354,3 +366,256 @@ In PostgreSQL, you pay for the server whether it's idle or processing 10,000 que
 - **Streaming inserts**: $0.01 per 200 MB. Batch loading from GCS is free.
 
 The partitioning and clustering we set up aren't just for performance — they're directly tied to cost. Every column you exclude from `SELECT *`, every partition you skip with a date filter, saves money.
+
+---
+
+## 17. Cloud Functions — Event-Driven Ingestion
+
+### The Pattern: GCS Upload → Cloud Function → BigQuery
+
+In a traditional stack, you'd write a cron job or a server endpoint to poll for new files. On GCP, the pattern is **event-driven**: a file upload to Cloud Storage fires an event, which triggers a Cloud Function that processes the file and writes to BigQuery. No polling, no server, no cron.
+
+```
+CSV upload to GCS bucket
+        │
+        ▼
+  Eventarc (OBJECT_FINALIZE event)
+        │
+        ▼
+  Cloud Function (Gen2)
+    ├── Downloads file from GCS
+    ├── Parses CSV, validates rows
+    └── Streaming inserts → BigQuery
+```
+
+### Cloud Functions Gen2 vs Gen1
+
+Gen2 is built on Cloud Run under the hood. Key differences:
+
+| Feature | Gen1 | Gen2 |
+|---|---|---|
+| Max timeout | 9 min | 60 min |
+| Max memory | 8 GB | 32 GB |
+| Concurrency | 1 request/instance | up to 1000 |
+| Triggers | Direct GCS/Pub/Sub | Eventarc (unified) |
+| Underlying | Custom runtime | Cloud Run |
+
+Always use Gen2 for new functions. Gen1 is legacy.
+
+### Deployment Command Breakdown
+
+```powershell
+gcloud functions deploy process-feedback-upload --gen2 --runtime=python312 --region=europe-west1 --source=ingestion/cloud_function/ --entry-point=process_upload --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" --trigger-event-filters="bucket=feedback-intel-raw-data" --trigger-location=eu --service-account=feedback-pipeline@feedback-intel-demo.iam.gserviceaccount.com --memory=512Mi --timeout=300s
+```
+
+Breaking it down:
+
+- `--gen2` — Use Cloud Functions 2nd generation (Cloud Run-backed)
+- `--runtime=python312` — Python 3.12 runtime
+- `--source=ingestion/cloud_function/` — Directory containing `main.py` + `requirements.txt`
+- `--entry-point=process_upload` — The function name inside `main.py` that gets called
+- `--trigger-event-filters="type=google.cloud.storage.object.v1.finalized"` — Fire on file upload completion
+- `--trigger-event-filters="bucket=feedback-intel-raw-data"` — Only for this specific bucket
+- `--trigger-location=eu` — **Critical:** must match the bucket's location. Our buckets are `EU` (multi-region), so the trigger location is `eu`. The function itself runs in `europe-west1`, but the Eventarc trigger that monitors the bucket must be co-located with it.
+- `--service-account=...` — Run as the pipeline SA (not your personal account)
+- `--memory=512Mi` — Memory allocation (default is 256Mi, bump up for CSV parsing)
+- `--timeout=300s` — Max execution time (5 min, plenty for ~2000 row CSV)
+
+### OBJECT_FINALIZE vs Other Events
+
+- `OBJECT_FINALIZE` — New object created **or** existing object overwritten. This is what you want 99% of the time.
+- `OBJECT_DELETE` — Object deleted (not useful for ingestion)
+- `OBJECT_ARCHIVE` — Object archived (versioned buckets only)
+- `OBJECT_METADATA_UPDATE` — Metadata changed but content didn't
+
+Re-uploading the same file triggers `OBJECT_FINALIZE` again — your function must handle this (either idempotent inserts, or check for duplicates).
+
+### Streaming Inserts vs Batch Load
+
+Two ways to get data into BigQuery:
+
+**Streaming inserts** (`bq.insert_rows_json()`):
+- Data available for querying within seconds
+- Costs $0.01 per 200 MB
+- Max 10,000 rows per request, 10 MB per request
+- Best for: real-time ingestion, small-to-medium files
+- Used by our Cloud Function
+
+**Batch load** (`bq load` or `load_table_from_uri()`):
+- Data available after job completes (seconds to minutes)
+- **Free** — no insert costs
+- No row limits
+- Best for: bulk historical loads, large files, cost-sensitive workloads
+- Used for: initial data migrations, large CSV/Parquet imports
+
+For our use case (~2000 rows per CSV), streaming inserts are fine. The cost is negligible. For 100M+ row batch loads, you'd use batch.
+
+### Reading Function Logs
+
+```powershell
+# Recent logs (most useful)
+gcloud functions logs read process-feedback-upload --region=europe-west1 --limit=20
+
+# Only errors
+gcloud functions logs read process-feedback-upload --region=europe-west1 --limit=20 --min-log-level=ERROR
+
+# Follow logs in real-time (useful during testing)
+gcloud functions logs read process-feedback-upload --region=europe-west1 --limit=50
+```
+
+Logs include everything from `print()` and `logging.*` calls in your function code. The Cloud Function runtime also adds its own logs (startup, shutdown, execution time, memory usage).
+
+### Testing Cloud Functions
+
+**Trigger by re-uploading a file:**
+```powershell
+gcloud storage cp data/seed_feedback.csv gs://feedback-intel-raw-data/seed_feedback.csv
+```
+Re-uploading the same file triggers `OBJECT_FINALIZE` again — useful for testing.
+
+**Check if the function exists and is healthy:**
+```powershell
+gcloud functions describe process-feedback-upload --region=europe-west1 --format="value(state)"
+```
+Should return `ACTIVE`.
+
+**Verify data landed in BigQuery:**
+```powershell
+bq query --use_legacy_sql=false "SELECT COUNT(*) as total FROM feedback.raw_feedback"
+bq query --use_legacy_sql=false "SELECT source, COUNT(*) as count FROM feedback.raw_feedback GROUP BY source"
+```
+
+### Common Gotchas
+
+1. **Function triggers on ALL files in the bucket** — including non-CSV files. Always check the file extension in your function code and skip non-CSV files early.
+
+2. **Re-upload = duplicate rows** — Streaming inserts don't check for duplicates. If you re-upload the same CSV, you get double the rows. For production, you'd add deduplication (check if file was already processed, or use `INSERT ... WHERE NOT EXISTS`).
+
+3. **Large files can timeout** — A 512Mi function with 300s timeout handles ~50k rows comfortably. For bigger files, either increase memory/timeout or switch to batch load.
+
+4. **Eventarc permissions (two separate fixes)** — Gen2 GCS-triggered functions need two permission grants:
+
+    **a) Eventarc's internal service agent needs bucket access:**
+    ```powershell
+    $PROJECT_NUMBER = (gcloud projects describe feedback-intel-demo --format="value(projectNumber)")
+    gcloud projects add-iam-policy-binding feedback-intel-demo --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-eventarc.iam.gserviceaccount.com" --role="roles/storage.admin"
+    ```
+    Error without it: `Permission "storage.buckets.get" denied on "Bucket ... could not be validated"`
+
+    **b) Your function's service account needs `eventarc.eventReceiver`:**
+    ```powershell
+    gcloud projects add-iam-policy-binding feedback-intel-demo --member="serviceAccount:feedback-pipeline@feedback-intel-demo.iam.gserviceaccount.com" --role="roles/eventarc.eventReceiver"
+    ```
+    Error without it: `Permission "eventarc.events.receiveEvent" denied`
+
+    **c) GCS service agent needs Pub/Sub publisher:**
+    ```powershell
+    $GCS_SA = (gcloud storage service-agent --project=feedback-intel-demo)
+    gcloud projects add-iam-policy-binding feedback-intel-demo --member="serviceAccount:$GCS_SA" --role="roles/pubsub.publisher"
+    ```
+    Error without it: `The Cloud Storage service account ... is unable to publish to Cloud Pub/Sub topics`
+
+    **d) Your function's SA needs Cloud Run invoker (Gen2 only):**
+    ```powershell
+    gcloud functions add-invoker-policy-binding process-feedback-upload --region=europe-west1 --member="serviceAccount:feedback-pipeline@feedback-intel-demo.iam.gserviceaccount.com"
+    ```
+    Error without it: `The request was not authenticated` in function logs (Eventarc delivers the event but Cloud Run rejects it)
+
+    All four are one-time setup. (a) is Eventarc's internal agent needing bucket access. (b) is your SA needing event receiver rights. (c) is the GCS service agent needing to publish events to Pub/Sub. (d) is your SA needing permission to invoke the Cloud Run service that backs the Gen2 function. This is the full IAM chain: **GCS → Pub/Sub → Eventarc → Cloud Run**.
+
+5. **Trigger location must match bucket location** — If your bucket is in `EU` (multi-region), the Eventarc trigger must also be `eu`. The function can run in `europe-west1`, but add `--trigger-location=eu` to the deploy command. Without this, you get: `"Bucket is in location 'eu', but the trigger location is 'europe-west1'"`. This is a common gotcha when mixing multi-region buckets with single-region functions.
+
+6. **Cold starts** — The first invocation after deployment or idle period takes 5-15 seconds longer (loading Python runtime + dependencies). Subsequent invocations are faster. Not an issue for batch processing, but matters for latency-sensitive use cases.
+
+7. **`SELECT DISTINCT` fails on JSON columns** — BigQuery's `JSON` type doesn't support equality comparison, so `SELECT DISTINCT *` fails if any column is JSON. You'll get: `Column feedback_metadata of type JSON is not groupable`. Use `ROW_NUMBER() OVER(PARTITION BY unique_key ORDER BY ingested_at DESC)` instead to dedup:
+
+    ```sql
+    WITH deduped AS (
+      SELECT *, ROW_NUMBER() OVER(PARTITION BY id ORDER BY ingested_at DESC) AS rn
+      FROM feedback.raw_feedback
+    )
+    SELECT * EXCEPT(rn) FROM deduped WHERE rn = 1
+    ```
+
+8. **`CREATE OR REPLACE TABLE` can't change partitioning spec** — If the original table has partitioning/clustering, `CREATE OR REPLACE TABLE ... AS SELECT` without a matching partition spec fails. BigQuery won't let you silently drop or change partitioning on a replace. The workaround is a three-step dance:
+
+    ```sql
+    -- Step 1: CTAS to a temp table with the partition/cluster spec you want
+    CREATE TABLE feedback.raw_feedback_deduped
+    PARTITION BY DATE(created_at)
+    CLUSTER BY source
+    AS SELECT * EXCEPT(rn) FROM (
+      SELECT *, ROW_NUMBER() OVER(PARTITION BY id ORDER BY ingested_at DESC) AS rn
+      FROM feedback.raw_feedback
+    ) WHERE rn = 1;
+
+    -- Step 2: Drop the original
+    DROP TABLE feedback.raw_feedback;
+
+    -- Step 3: Rename temp to original
+    ALTER TABLE feedback.raw_feedback_deduped RENAME TO raw_feedback;
+    ```
+
+9. **Eventarc retry storm after fixing IAM** — When deploying a GCS-triggered Cloud Function, if IAM permissions are missing at deploy time, Eventarc queues the events and retries them (up to 7 days by default). Once you fix the permissions, ALL queued retries fire at once, causing duplicate processing. In our case, a single CSV upload of 1967 rows resulted in 3934 rows in BigQuery because the function was invoked twice (original + queued retry). **Mitigation**: Always dedup after first deployment, or build idempotency into the function (e.g., check if file was already processed before inserting, or use `MERGE` instead of `INSERT`).
+
+10. **Streaming buffer blocks DML** — After streaming inserts (`insert_rows_json`), those rows sit in a buffer for ~30 minutes. During this window, `DELETE` and `UPDATE` statements that would affect buffered rows will fail with "would affect rows in the streaming buffer, which is not supported". Workaround: wait ~30 min, or use CTAS to rebuild the table. In production, design around this by using batch loads (`load_table_from_*`) instead of streaming when you need immediate DML access.
+
+11. **UTF-8 BOM in CSV files** — Files created by PowerShell (`Out-File -Encoding utf8`) or Excel include a BOM (`\ufeff`) at the start. Python's `csv.DictReader` doesn't strip it, so the first header becomes `\ufeffid` instead of `id`. Fix: strip BOM before parsing: `if content.startswith("\ufeff"): content = content[1:]`. Alternative: use `encoding="utf-8-sig"` which auto-strips BOM.
+
+---
+
+## 18. Google Gen AI SDK (google-genai) — The Current Way
+
+### Why Not vertexai.generative_models?
+
+The `vertexai.generative_models` module (from `google-cloud-aiplatform`) was deprecated June 24, 2025 and will be removed June 24, 2026. Google consolidated everything into a single SDK: `google-genai`.
+
+### Installation
+
+```powershell
+pip install google-genai
+```
+
+Replaces `google-cloud-aiplatform` for all generative AI use cases.
+
+### The Pattern
+
+```python
+from google import genai
+from google.genai import types
+
+# Initialize client — vertexai=True routes through Vertex AI (your GCP project)
+# Without vertexai=True, it uses the Gemini Developer API (API key based)
+client = genai.Client(vertexai=True, project="feedback-intel-demo", location="europe-west1")
+
+# Generate content
+response = client.models.generate_content(
+    model="gemini-2.5-flash-lite",
+    contents="Your prompt here",
+    config=types.GenerateContentConfig(
+        temperature=1.0,
+        max_output_tokens=8192,
+    ),
+)
+
+print(response.text)
+```
+
+### Key Differences from Old SDK
+
+| Old (`vertexai.generative_models`) | New (`google-genai`) |
+|---|---|
+| `vertexai.init(project=..., location=...)` | `client = genai.Client(vertexai=True, project=..., location=...)` |
+| `model = GenerativeModel("gemini-2.5-flash-lite")` | Model specified per-call |
+| `model.generate_content(prompt, generation_config={...})` | `client.models.generate_content(model=..., contents=..., config=types.GenerateContentConfig(...))` |
+| Config is a plain dict | Config is a typed object (`types.GenerateContentConfig`) |
+
+### Authentication
+
+The SDK uses Application Default Credentials (ADC). Set up once:
+
+```powershell
+gcloud auth application-default login
+```
+
+This saves credentials to `%APPDATA%/gcloud/application_default_credentials.json`. The SDK finds them automatically. No API keys, no environment variables, no key files to manage.
