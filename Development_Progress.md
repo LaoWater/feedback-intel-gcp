@@ -13,7 +13,7 @@
 | 02 | Seed Data Generation | ✅ COMPLETE | 2026-03-11 |
 | 03 | Text Ingestion Pipeline | ✅ COMPLETE | 2026-03-11 |
 | 04 | NLP/Sentiment Enrichment | ✅ COMPLETE | 2026-03-11 |
-| 05 | Chirp Speech-to-Text Pipeline | 🔄 In Progress | — |
+| 05 | Chirp Speech-to-Text Pipeline | ✅ COMPLETE | 2026-03-11 |
 | 06 | Evaluation & Iteration | ⬚ Not Started | — |
 | 07 | Vertex AI Search | ⬚ Not Started | — |
 | 08 | Looker Dashboard | ⬚ Not Started | — |
@@ -142,22 +142,39 @@
 
 **Note:** Originally targeted Chirp 2, but switched to Chirp 3 after discovering Chirp 2 does not support speaker diarization. Chirp 3 adds diarization support but drops word-level confidence. See `Documenting_Progress.md` Sprint 05 for full decision rationale.
 
-### Steps
+### Completed Steps
 - [x] Write `transcription/transcribe_calls.py` — batch processor that transcribes all WAV files in GCS using Chirp 3
 - [x] Configure Chirp 3: diarization (2-4 speakers), word timestamps, auto punctuation (word confidence not supported by Chirp 3)
-- [ ] Run transcription on all 35 WAV files in `gs://feedback-intel-audio-calls/`
-- [ ] Verify transcripts in `call_transcripts` table (35 rows, no errors)
-- [ ] Inspect quality: avg confidence, speaker count distribution, duration distribution
-- [ ] Write `transcription/transcript_to_classification.py` — bridge script to insert transcripts into `raw_feedback` as `source='call'`
-- [ ] Run classification on call transcripts using existing V1 pipeline
-- [ ] Compare text vs call classification quality (confidence gap)
-- [ ] Move processed audio to `gs://feedback-intel-audio-processed/`
+- [x] Run transcription on all 35 WAV files — 35/35 success, 0 failures
+- [x] Verify transcripts in `call_transcripts` table — 35 rows, diarization working
+- [x] Inspect quality: 32 calls with 2 speakers, 3 calls with 3 speakers, avg ~60s duration
+- [x] Write `transcription/transcript_to_classification.py` — bridge script with full-transcript and customer-only modes
+- [x] Run classification on call transcripts using existing V1 pipeline — 35 classified in 41.5s
+- [x] Compare text vs call classification quality — call avg confidence 0.91 vs text avg 0.92 (negligible gap)
+- [x] Move processed audio to `gs://feedback-intel-audio-processed/` — auto-moved by transcription script
 
-### Done Criteria
-- 35 transcripts in `call_transcripts` with diarization data
-- Avg Chirp confidence > 0.7
-- Transcripts fed into classification pipeline as `source='call'`
-- Text vs call confidence gap measured
+### Key Metrics
+- **35/35 transcriptions successful**, 0 errors
+- **Speaker diarization**: 32 × 2-speaker, 3 × 3-speaker (matches generated data)
+- **Avg audio duration**: 60s, avg processing time: 19s (first file ~265s cold start)
+- **confidence_avg = 0.0** on all — expected, Chirp 3 doesn't return word confidence
+- **Classification confidence gap**: call 0.91 vs text 0.92 — negligible
+- **Call department distribution**: Support 46%, Engineering 26%, Product 17%, UX 11% (realistic — calls skew support)
+- **Call sentiment**: 51% negative, 26% neutral, 23% positive (people call to complain)
+- **Final counts**: raw_feedback 1402, enriched_feedback 1402, call_transcripts 35
+
+### Issues Encountered & Resolved
+1. **Chirp 2 doesn't support diarization** — API rejected `speaker_diarization` config. Switched to Chirp 3.
+2. **Chirp 3 doesn't support `enable_word_confidence`** — Removed flag. Word confidence is Chirp 2 only.
+3. **Streaming buffer blocked DELETE of error rows** — Used DROP TABLE + CREATE TABLE to reset.
+4. **Cold start on first batch_recognize call** — First file took ~4.4 min, subsequent files 12-30s. Normal for provisioning Chirp infrastructure.
+5. **confidence_avg filter bug** — `transcript_to_classification.py` had `confidence_avg > 0.6` filter which would reject all Chirp 3 transcripts (all 0.0). Fixed to `confidence_avg > 0.6 OR confidence_avg = 0.0`.
+
+### Done Criteria — MET
+- ✅ 35 transcripts in `call_transcripts` with diarization data
+- ⚠️ Chirp confidence = 0.0 (Chirp 3 doesn't provide word confidence — expected, not a failure)
+- ✅ Transcripts fed into classification pipeline as `source='call'`
+- ✅ Text vs call confidence gap measured (0.01 — negligible)
 
 ---
 

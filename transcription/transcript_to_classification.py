@@ -42,7 +42,9 @@ def feed_full_transcripts():
     LEFT JOIN `feedback.raw_feedback` r ON t.id = r.id
     WHERE r.id IS NULL
       AND t.error_message IS NULL
-      AND t.confidence_avg > 0.6
+      AND (t.confidence_avg > 0.6 OR t.confidence_avg = 0.0)
+      -- confidence_avg = 0.0 means Chirp 3 (no word confidence support)
+      -- confidence_avg > 0.6 filters bad Chirp 2 transcripts if we ever use it
     """
     job = bq.query(query)
     job.result()
@@ -81,7 +83,9 @@ def feed_customer_only_transcripts():
     LEFT JOIN `feedback.raw_feedback` r ON t.id = r.id
     WHERE r.id IS NULL
       AND t.error_message IS NULL
-      AND t.confidence_avg > 0.6
+      AND (t.confidence_avg > 0.6 OR t.confidence_avg = 0.0)
+      -- confidence_avg = 0.0 means Chirp 3 (no word confidence support)
+      -- confidence_avg > 0.6 filters bad Chirp 2 transcripts if we ever use it
     """
     job = bq.query(query)
     job.result()

@@ -164,7 +164,22 @@ We used streaming for convenience, but batch loads would have been smarter for E
 - "I used streaming inserts for speed but learned about the 30-min DML buffer. In production, batch loads are free and support immediate mutations."
 - "Chirp is the model, STT V2 is the API — same pattern as Gemini and Vertex AI."
 
-*(Results pending — transcription running)*
+### Results
+
+**Transcription:** 35/35 files transcribed, 0 failures. Avg 60s audio processed in avg 19s (first file 265s cold start — Chirp provisioning infrastructure). 32 calls detected 2 speakers, 3 calls detected 3 speakers. Diarization cleanly separates agent vs customer speech.
+
+**The confidence_avg = 0.0 catch:** Since Chirp 3 doesn't provide word confidence, every transcript stored `confidence_avg = 0.0`. This silently broke the downstream bridge script (`transcript_to_classification.py`) which filtered `WHERE confidence_avg > 0.6` — rejecting ALL transcripts. Fixed to `(confidence_avg > 0.6 OR confidence_avg = 0.0)` so Chirp 3's "no data" passes through while still filtering genuinely low-confidence Chirp 2 results.
+
+**Classification of call transcripts:** 35 records classified in 41.5s. Call avg confidence 0.91 vs text avg 0.92 — practically identical. Calls skew toward Support (46%) and negative sentiment (51%), which is realistic (people call when they have problems).
+
+**Cold start on batch_recognize:** First API call took 265s (~4.4 min). Subsequent calls: 12-30s. This is the Chirp 3 batch infrastructure warming up — not a bug, just the reality of on-demand ML inference. In production, you'd keep recognizers warm with periodic health checks.
+
+**Hiccup: Stale error rows survive re-runs.**
+The transcription script logs error rows to BigQuery (so we don't retry failed files forever). But when we DROP + CREATE the table and re-run successfully, the old error rows from previous runs don't get cleaned automatically — the idempotency check (`get_already_transcribed()`) only looks at `WHERE error_message IS NULL`, so it re-transcribes error files correctly but doesn't delete the old error row. Result: 36 rows (35 success + 1 stale error). Harmless — all downstream queries filter `WHERE error_message IS NULL` — but worth noting.
+
+**Interview one-liner (new):**
+- "Chirp 3 doesn't return word confidence, so any downstream filters on confidence need to handle 0.0 as 'no data available' rather than 'bad transcription.'"
+- "The first batch_recognize call takes 4-5 minutes (cold start). Subsequent calls drop to 15-30 seconds. Plan for this in pipeline timeouts."
 
 ---
 
