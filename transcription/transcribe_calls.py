@@ -77,7 +77,7 @@ def transcribe_file(audio_uri: str) -> dict:
         model=CHIRP_MODEL,
         features=cloud_speech.RecognitionFeatures(
             enable_word_time_offsets=True,
-            enable_word_confidence=True,
+            # enable_word_confidence — NOT supported by Chirp 3 (Chirp 2 only)
             enable_automatic_punctuation=True,
             diarization_config=cloud_speech.SpeakerDiarizationConfig(
                 min_speaker_count=2,   # At least agent + customer

@@ -13,7 +13,7 @@
 | 02 | Seed Data Generation | ✅ COMPLETE | 2026-03-11 |
 | 03 | Text Ingestion Pipeline | ✅ COMPLETE | 2026-03-11 |
 | 04 | NLP/Sentiment Enrichment | ✅ COMPLETE | 2026-03-11 |
-| 05 | Chirp Speech-to-Text Pipeline | ⬚ Not Started | — |
+| 05 | Chirp Speech-to-Text Pipeline | 🔄 In Progress | — |
 | 06 | Evaluation & Iteration | ⬚ Not Started | — |
 | 07 | Vertex AI Search | ⬚ Not Started | — |
 | 08 | Looker Dashboard | ⬚ Not Started | — |
@@ -138,11 +138,13 @@
 
 ## Sprint 05 — Chirp Speech-to-Text Pipeline
 
-**Goal:** Transcribe 35 WAV files using Chirp 2 via Cloud Speech-to-Text V2 API. Store transcripts in `call_transcripts`. Feed into classification pipeline.
+**Goal:** Transcribe 35 WAV files using Chirp 3 via Cloud Speech-to-Text V2 API with speaker diarization. Store transcripts in `call_transcripts`. Feed into classification pipeline.
+
+**Note:** Originally targeted Chirp 2, but switched to Chirp 3 after discovering Chirp 2 does not support speaker diarization. Chirp 3 adds diarization support but drops word-level confidence. See `Documenting_Progress.md` Sprint 05 for full decision rationale.
 
 ### Steps
-- [ ] Write `transcription/transcribe_calls.py` — batch processor that transcribes all WAV files in GCS using Chirp 2
-- [ ] Configure Chirp: diarization (2-4 speakers), word timestamps, word confidence, auto punctuation
+- [x] Write `transcription/transcribe_calls.py` — batch processor that transcribes all WAV files in GCS using Chirp 3
+- [x] Configure Chirp 3: diarization (2-4 speakers), word timestamps, auto punctuation (word confidence not supported by Chirp 3)
 - [ ] Run transcription on all 35 WAV files in `gs://feedback-intel-audio-calls/`
 - [ ] Verify transcripts in `call_transcripts` table (35 rows, no errors)
 - [ ] Inspect quality: avg confidence, speaker count distribution, duration distribution

@@ -562,6 +562,10 @@ bq query --use_legacy_sql=false "SELECT source, COUNT(*) as count FROM feedback.
 
 11. **UTF-8 BOM in CSV files** — Files created by PowerShell (`Out-File -Encoding utf8`) or Excel include a BOM (`\ufeff`) at the start. Python's `csv.DictReader` doesn't strip it, so the first header becomes `\ufeffid` instead of `id`. Fix: strip BOM before parsing: `if content.startswith("\ufeff"): content = content[1:]`. Alternative: use `encoding="utf-8-sig"` which auto-strips BOM.
 
+12. **DROP TABLE bypasses streaming buffer** — When you can't DELETE rows due to the streaming buffer, DROP TABLE + CREATE TABLE is the nuclear option. It works because DROP removes the entire table object (buffer included), unlike DML which tries to modify individual rows. Use when the table has no good data worth preserving.
+
+13. **Streaming insert error rows pollute tables** — If your pipeline uses streaming inserts and encounters errors, the error rows get inserted too (for audit/debugging). But they sit in the streaming buffer for ~30 min, blocking cleanup. Design pattern: filter on `error_message IS NULL` in all downstream queries, and clean up error rows later when the buffer clears.
+
 ---
 
 ## 18. Google Gen AI SDK (google-genai) — The Current Way

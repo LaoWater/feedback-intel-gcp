@@ -112,6 +112,62 @@ daily_summary (materialized view, auto-refreshes)
 
 ---
 
+## Sprint 05 — Chirp Speech-to-Text Pipeline
+
+**What we're building:** Transcribe 35 synthetic call WAV files using Chirp 3 via Cloud Speech-to-Text V2 API with speaker diarization. Store in `call_transcripts`, then feed into classification pipeline.
+
+**Hiccup: Chirp 2 doesn't support diarization.**
+Our first attempt used Chirp 2 (`chirp_2` model, `europe-west4` region). Deployment worked but the API rejected our config: "Recognizer does not support feature: speaker_diarization". Research revealed that Chirp 2 supports word-level timestamps and confidence but NOT speaker diarization. Diarization was added in Chirp 3.
+
+**Decision: Chirp 3 over Chirp 2 — and why.**
+
+| Feature | Chirp 2 | Chirp 3 |
+|---|---|---|
+| Speaker diarization | :x: | :white_check_mark: (BatchRecognize + Recognize) |
+| Word-level timestamps | :white_check_mark: Solid | :warning: Some degradation |
+| Word-level confidence | :white_check_mark: Reliable | :x: Not supported |
+| Auto punctuation | :white_check_mark: | :white_check_mark: |
+| Max audio (batch) | 8 hours | 1 hour |
+| Regions (GA) | us-central1, europe-west4, asia-southeast1 | us, eu (multi-region) |
+
+We chose Chirp 3 because:
+1. Diarization lets us separate agent vs customer speech → cleaner classification
+2. `eu` multi-region GA matches our bucket location
+3. Word confidence loss isn't critical — we have ground truth for WER evaluation
+4. Our calls are 1-3 min, well within the 1 hour limit
+
+**Hiccup: Chirp 3 doesn't support `enable_word_confidence`.**
+After switching to Chirp 3, got: "Recognizer does not support feature: word_level_confidence". Makes sense — the Chirp 3 docs explicitly list word-level confidence as unsupported. Removed the flag.
+
+**Hiccup: Streaming buffer blocks cleanup (again).**
+Error rows from the failed Chirp 2 attempt were inserted via streaming (`insert_rows_json`). Couldn't DELETE them due to the ~30 min streaming buffer. Fix: DROP TABLE + CREATE TABLE (nuclear but effective when there's no good data to preserve).
+
+**Lesson learned: Streaming vs Batch inserts.**
+
+| | Streaming (`insert_rows_json`) | Batch Load (`load_table_from_*`) |
+|---|---|---|
+| Speed | Rows visible in seconds | 30s-2min |
+| Cost | $0.01 per 200 MB | Free |
+| DML after insert | :x: Blocked ~30 min | :white_check_mark: Immediate |
+| Best for | Real-time events | ETL, bulk imports |
+
+We used streaming for convenience, but batch loads would have been smarter for ETL pipelines — free, immediate DML, and dedup support via write dispositions.
+
+**Key concepts:**
+- Google Chirp is the MODEL. Cloud Speech-to-Text V2 is the API. Same pattern as Gemini/Vertex AI.
+- `batch_recognize` (not `recognize`) for files > 60 seconds — async, reads directly from GCS.
+- The wildcard recognizer `projects/{project}/locations/{location}/recognizers/_` avoids needing to pre-create a recognizer resource.
+- `AutoDetectDecodingConfig` handles any sample rate automatically (our TTS was 24kHz, Chirp handles it).
+
+**Interview one-liners:**
+- "Chirp 2 has better word-level metrics but no diarization. Chirp 3 adds diarization but drops word confidence. Choose based on whether you need speaker separation."
+- "I used streaming inserts for speed but learned about the 30-min DML buffer. In production, batch loads are free and support immediate mutations."
+- "Chirp is the model, STT V2 is the API — same pattern as Gemini and Vertex AI."
+
+*(Results pending — transcription running)*
+
+---
+
 ## Running Themes
 
 ### Things that keep coming up
@@ -119,6 +175,7 @@ daily_summary (materialized view, auto-refreshes)
 - **BigQuery has opinions.** Partitioning specs are immutable on replace. JSON columns can't be compared. Streaming buffers block DML. Learn the constraints or waste hours.
 - **LLM SDKs move fast.** The Vertex AI SDK we started with was already deprecated. Always check the latest docs before writing production code.
 - **PowerShell vs Linux assumptions.** BOM in files, backtick escaping eaten by PowerShell, `gsutil` deprecated in favor of `gcloud storage`. Small things that waste big time.
+- **Model feature matrices matter.** Chirp 2 vs 3, Gemini Flash vs Flash Lite — each model has specific feature support. Always check the docs before writing code. Don't assume a newer model supports everything the older one did.
 
 ### Interview-ready one-liners
 - "Gen2 Cloud Functions are Cloud Run + Eventarc + Pub/Sub. You're debugging three systems."
