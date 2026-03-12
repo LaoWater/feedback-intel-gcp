@@ -183,6 +183,64 @@ The transcription script logs error rows to BigQuery (so we don't retry failed f
 
 ---
 
+## Sprint 06 — Evaluation & Iteration
+
+**What we built:** WER evaluation for Chirp transcriptions + classification accuracy check for the full call pipeline. Also discovered a taxonomy mismatch between data generation and classification.
+
+### The synthetic data reckoning
+
+The original plan said "manually label 100 test records." We stopped and asked: label them with what? The feedback is synthetic — Gemini wrote it. If a human reads Gemini's text and says "this is Engineering," and the classifier also says "Engineering," that's two readers agreeing on text that was *designed to be classifiable*. It's circular. It proves nothing.
+
+The honest answer: text classification accuracy on synthetic data cannot be meaningfully evaluated. The only real evaluation requires labeled production data with known ground truth (actual department routing, actual customer sentiment from follow-up surveys, etc.).
+
+What we CAN evaluate:
+1. **WER** — the original script text went through TTS → audio → Chirp STT. Comparing Chirp's output to the original script is a real, clean metric.
+2. **Call classification through STT noise** — the ground truth JSONs have `expected_department` and `expected_sentiment` set at generation time. Since the text went through TTS → STT (introducing real word errors), checking if classification survives that noise tests the full pipeline's signal preservation.
+
+### WER results: 4.02% micro-average
+
+Chirp 3 transcribed 35 calls with 6,047 total words and got 243 wrong. That's a 4.02% WER — well under any reasonable production threshold.
+
+**The error pattern is revealing:** 142 insertions vs 70 substitutions vs 31 deletions. Chirp adds extra words more than it mishears them. On clean TTS audio, the model rarely confuses one word for another — but it sometimes hallucinates filler words or splits compound words.
+
+**Department consistency:** WER ranged from 3.6% to 4.5% across departments. No vocabulary domain is notably harder for Chirp.
+
+**The caveat we documented:** this is TTS→STT round-trip on synthetic audio. Real human speech with accents, background noise, crosstalk, and mumbling would push WER higher. The pipeline works; the exact number is optimistic.
+
+### Call classification: 82.9% department, 89.3% sentiment
+
+This is where it gets interesting. The classifier gets the department right on 29/35 calls that went through the full pipeline (script → TTS → Chirp STT → Gemini classification).
+
+**Engineering: 8/8 perfect.** Bug reports are unambiguous even through STT noise.
+
+**Negative sentiment: 14/14 perfect.** The classifier never misses an angry customer. The 3 sentiment errors were all neutral↔positive confusion — the least consequential type of miss.
+
+### The taxonomy mismatch discovery
+
+During evaluation we found that the ground truth JSONs use 6 departments (Engineering, Product, UX, Support, **Billing**, **Logistics**) but the classifier only knows 4. Ten out of 35 calls have departments the classifier literally cannot output.
+
+We mapped Billing→Support and Logistics→Support for comparison (closest semantic match). Of those 10, 8 were correctly classified as Support.
+
+The 6 department misclassifications are all genuine edge cases:
+- "Customer struggles to find billing info" — is that UX (navigation) or Support (billing question)? Both are defensible.
+- Two Billing calls about plan upgrades/downgrades → classified as Product. Because subscription tier changes ARE product decisions. The Billing→Support mapping is debatable here.
+- A feature report that mentions bugs → Product expected, got Engineering. Reasonable.
+
+**Interview takeaway:** In production, you'd either expand the classifier's taxonomy to match the business reality (add Billing, Logistics as separate departments) or maintain an explicit mapping with documented trade-offs. The fact that we found this gap in evaluation is exactly why you evaluate.
+
+### What we deliberately skipped
+
+- **V1→V2→V3 prompt comparison on synthetic data.** V1 works well. The prompts are written, the methodology (version tracking via `model_version` field, structured evaluation framework) is in place. Running all three against synthetic data to produce fake improvement metrics would look good on paper but fall apart in an interview. "What was your ground truth?" is a question we'd rather answer honestly.
+- **100 labeled test records.** Not meaningful on synthetic text. The evaluation framework (`evaluate_call_classification.py`) works — plug in real labeled data and it runs the same way.
+
+**Interview one-liners:**
+- "WER is the standard metric for STT accuracy. Ours was 4% on synthetic audio — realistic floor, not ceiling."
+- "You can't evaluate an LLM classifier on LLM-generated data. The evaluation framework matters more than fake metrics."
+- "We found a taxonomy mismatch during evaluation — 6 departments in the data, 4 in the classifier. That's the kind of thing evaluation is for."
+- "Insertions dominated our WER errors — Chirp adds words more than it mishears them on clean audio."
+
+---
+
 ## Running Themes
 
 ### Things that keep coming up
@@ -191,9 +249,14 @@ The transcription script logs error rows to BigQuery (so we don't retry failed f
 - **LLM SDKs move fast.** The Vertex AI SDK we started with was already deprecated. Always check the latest docs before writing production code.
 - **PowerShell vs Linux assumptions.** BOM in files, backtick escaping eaten by PowerShell, `gsutil` deprecated in favor of `gcloud storage`. Small things that waste big time.
 - **Model feature matrices matter.** Chirp 2 vs 3, Gemini Flash vs Flash Lite — each model has specific feature support. Always check the docs before writing code. Don't assume a newer model supports everything the older one did.
+- **Synthetic data has hard evaluation limits.** You can evaluate the pipeline (does signal survive TTS→STT→classification?) but you can't evaluate the classifier itself without real labeled data. Know the difference. Build the framework, don't fake the metrics.
+- **Taxonomy mismatches surface in evaluation.** Your data and your classifier might use different categories. Evaluation is when you find out. Document it, don't hide it.
 
 ### Interview-ready one-liners
 - "Gen2 Cloud Functions are Cloud Run + Eventarc + Pub/Sub. You're debugging three systems."
 - "Eventarc retries are persistent — if you fix IAM after failed deliveries, every queued retry fires at once."
 - "BigQuery streaming inserts are append-only for 30 minutes. Design around it or use batch loads."
 - "Always validate LLM output structure — temperature=0 doesn't mean the schema is guaranteed."
+- "WER is the standard metric for STT accuracy. Ours was 4% on synthetic audio — realistic floor, not ceiling."
+- "You can't evaluate an LLM classifier on LLM-generated data. The evaluation framework matters more than fake metrics."
+- "We found a taxonomy mismatch during evaluation — 6 departments in the data, 4 in the classifier. That's the kind of thing evaluation is for."
