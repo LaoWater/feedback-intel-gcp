@@ -24,6 +24,7 @@ import sys
 import time
 
 from google.api_core.client_options import ClientOptions
+from google.api_core.exceptions import AlreadyExists
 from google.cloud import discoveryengine
 
 # ─── Config ─────────────────────────────────────────────────────────
@@ -35,8 +36,10 @@ DATA_STORE_ID = "feedback-store"
 ENGINE_ID = "feedback-search-app"
 
 # BigQuery source
+# Vertex AI Search requires an '_id' field for custom schema.
+# Our table uses 'id', so we created a view that renames it.
 BQ_DATASET = "feedback"
-BQ_TABLE = "enriched_feedback"
+BQ_TABLE = "enriched_feedback_search"   # View: renames id → _id
 
 # Client options (global doesn't need a regional endpoint)
 CLIENT_OPTIONS = (
@@ -52,10 +55,12 @@ CLIENT_OPTIONS = (
 
 def create_data_store():
     """
-    Create a Vertex AI Search data store.
+    Create a Vertex AI Search data store for structured BigQuery data.
 
     The data store is a container that holds indexed documents.
-    We'll connect it to our BigQuery enriched_feedback table.
+    We use NO_CONTENT because our data is structured fields from BigQuery
+    (not document content like PDFs). CONTENT_REQUIRED is for unstructured
+    document stores — using it with structured data causes import failures.
     """
     client = discoveryengine.DataStoreServiceClient(client_options=CLIENT_OPTIONS)
 
@@ -69,7 +74,9 @@ def create_data_store():
         display_name="Customer Feedback",
         industry_vertical=discoveryengine.IndustryVertical.GENERIC,
         solution_types=[discoveryengine.SolutionType.SOLUTION_TYPE_SEARCH],
-        content_config=discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED,
+        # NO_CONTENT for structured BigQuery data (fields ARE the data).
+        # CONTENT_REQUIRED is for document stores (PDFs, HTML, etc.)
+        content_config=discoveryengine.DataStore.ContentConfig.NO_CONTENT,
     )
 
     request = discoveryengine.CreateDataStoreRequest(
@@ -134,6 +141,98 @@ def import_bigquery_data():
     return result
 
 
+def update_schema():
+    """
+    Update the data store schema to make fields filterable and searchable.
+
+    By default, Vertex AI Search auto-detects the schema from BigQuery but
+    doesn't know which fields should be filterable (for query filters) vs
+    searchable (for full-text matching). We set annotations:
+
+    - text:       searchable (main content for semantic search)
+    - department:  indexable + retrievable (filter + return in results)
+    - source:      indexable + retrievable
+    - sentiment:   indexable + retrievable
+    - tone:        indexable + retrievable
+    - id:          retrievable
+    - confidence:  retrievable
+
+    'indexable' = can be filtered, faceted, boosted, or sorted
+    'searchable' = can be reverse-indexed for text matching
+    'retrievable' = can be returned in search results
+    """
+    client = discoveryengine.SchemaServiceClient(client_options=CLIENT_OPTIONS)
+
+    schema_name = (
+        f"projects/{PROJECT_ID}/locations/{LOCATION}"
+        f"/collections/{COLLECTION}"
+        f"/dataStores/{DATA_STORE_ID}"
+        f"/schemas/default_schema"
+    )
+
+    schema = discoveryengine.Schema(
+        name=schema_name,
+        struct_schema={
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "searchable": True,
+                    "retrievable": True,
+                },
+                "department": {
+                    "type": "string",
+                    "indexable": True,
+                    "retrievable": True,
+                    "dynamicFacetable": True,
+                },
+                "source": {
+                    "type": "string",
+                    "indexable": True,
+                    "retrievable": True,
+                    "dynamicFacetable": True,
+                },
+                "sentiment": {
+                    "type": "string",
+                    "indexable": True,
+                    "retrievable": True,
+                    "dynamicFacetable": True,
+                },
+                "tone": {
+                    "type": "string",
+                    "indexable": True,
+                    "retrievable": True,
+                },
+                "id": {
+                    "type": "string",
+                    "retrievable": True,
+                },
+                "confidence": {
+                    "type": "number",
+                    "retrievable": True,
+                },
+                "customer_id": {
+                    "type": "string",
+                    "retrievable": True,
+                },
+                "model_version": {
+                    "type": "string",
+                    "retrievable": True,
+                },
+            },
+        },
+    )
+
+    request = discoveryengine.UpdateSchemaRequest(schema=schema)
+
+    print(f"Updating schema (marking fields as filterable/searchable)...")
+    operation = client.update_schema(request=request)
+    result = operation.result()
+    print(f"  Schema updated. Re-indexing triggered (may take a few minutes).")
+    return result
+
+
 def create_search_engine():
     """
     Create a search engine (app) on top of the data store.
@@ -187,25 +286,27 @@ def run_setup():
     # Step 1: Create data store
     try:
         create_data_store()
-    except Exception as e:
-        if "ALREADY_EXISTS" in str(e):
-            print(f"  Data store '{DATA_STORE_ID}' already exists — skipping.")
-        else:
-            raise
+    except AlreadyExists:
+        print(f"  Data store '{DATA_STORE_ID}' already exists — skipping.")
     print()
 
     # Step 2: Import BigQuery data
     import_bigquery_data()
     print()
 
-    # Step 3: Create search engine
+    # Step 3: Update schema (mark fields as filterable/searchable)
+    try:
+        update_schema()
+    except Exception as e:
+        print(f"  Schema update warning: {e}")
+        print(f"  (Schema may already be configured — continuing.)")
+    print()
+
+    # Step 4: Create search engine
     try:
         create_search_engine()
-    except Exception as e:
-        if "ALREADY_EXISTS" in str(e):
-            print(f"  Search engine '{ENGINE_ID}' already exists — skipping.")
-        else:
-            raise
+    except AlreadyExists:
+        print(f"  Search engine '{ENGINE_ID}' already exists — skipping.")
     print()
 
     print("=" * 60)
