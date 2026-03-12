@@ -229,13 +229,24 @@
 
 ## Sprint 07 — Vertex AI Search
 
-**Goal:** Semantic search over all classified feedback (text + calls).
+**Goal:** Semantic search over all classified feedback (text + calls) using Vertex AI Search — Google's managed RAG-as-a-service.
+
+**What Vertex AI Search is:** Instead of building a custom vector database + embedding pipeline + retrieval system + summary generator, Vertex AI Search handles all of it behind one API. Point it at a BigQuery table, it indexes everything, and natural language queries return semantically matched results + AI-generated summaries with citations. It understands *meaning*, not just keywords — "couldn't complete my purchase" matches even without the word "checkout."
+
+**Three components:**
+1. **Data Store** — connected to `enriched_feedback` in BigQuery. Indexes all classified feedback.
+2. **Search Engine (App)** — the query interface on top of the data store.
+3. **Python query function** — `search_feedback(query, department, source)` that calls the API.
+
+**Cost:** ~$1.50 per 1,000 queries. For a portfolio demo with ~50-100 queries, this is pennies. $300 GCP credit / $1,000 Vertex AI Search promo credit covers it.
 
 ### Steps
+- [ ] Enable Discovery Engine API
 - [ ] Create data store connected to BigQuery `enriched_feedback`
-- [ ] Create search app
-- [ ] Write `search/search_feedback()` with department and source filters
-- [ ] Test: "delivery complaints", "app crashes", "billing issues"
+- [ ] Create search engine (app) on top of the data store
+- [ ] Write `search/search_feedback.py` — setup + query function
+- [ ] Test queries: "delivery complaints", "app crashes", "billing issues"
+- [ ] Test filters: department, source (calls vs text)
 
 ### Done Criteria
 - Search returns relevant results with AI summary

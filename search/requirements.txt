@@ -1,0 +1,2 @@
+# Sprint 07 — Vertex AI Search dependencies
+google-cloud-discoveryengine   # Vertex AI Search (Discovery Engine) SDK

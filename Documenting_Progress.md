@@ -241,6 +241,64 @@ The 6 department misclassifications are all genuine edge cases:
 
 ---
 
+## Sprint 07 — Vertex AI Search
+
+**What we're building:** A semantic search layer over all classified feedback — text tickets, reviews, surveys, and call transcripts — using Vertex AI Search (Google's managed RAG-as-a-service).
+
+### Understanding Vertex AI Search (the "why" before the "how")
+
+Before this sprint, we had ~1,400 classified records in `enriched_feedback` (BigQuery). A product manager wanting to know "what are customers saying about login problems?" would need SQL:
+
+```sql
+SELECT * FROM enriched_feedback WHERE text LIKE '%login%' OR text LIKE '%password%'
+```
+
+That's keyword matching. It misses feedback like "I couldn't access my account" because none of the keywords match, even though the *meaning* is identical.
+
+**Vertex AI Search solves this by understanding meaning, not just keywords.** Under the hood, it:
+1. Embeds every record into a vector (numerical representation of meaning)
+2. When you query, embeds your question the same way
+3. Finds records with similar meaning (semantic matching)
+4. Generates an AI summary of the matching results with citations
+
+Instead of building this yourself (vector database + embedding pipeline + retrieval logic + summarization), Google packages it all behind one API. That's what "RAG-as-a-service" means — Retrieval-Augmented Generation where the retrieval is managed for you.
+
+### Architecture
+
+```
+enriched_feedback (BigQuery, 1400+ records)
+    │
+    ▼
+Vertex AI Search Data Store (indexes everything)
+    │
+    ▼
+Search Engine / App (query interface)
+    │
+    ▼
+search_feedback(query, department, source)  ← Python function
+    │
+    ▼
+Returns: AI summary with citations + top matching records
+```
+
+### Three components we create
+
+1. **Data Store** — connected to our BigQuery `enriched_feedback` table. Vertex AI Search reads the table and indexes all records. When we add new classified feedback, it can re-sync.
+
+2. **Search Engine (App)** — sits on top of the data store. This is the query endpoint. It handles embedding queries, matching, ranking, and generating summaries. Enterprise tier includes generative answers (AI summaries) at no extra cost per query.
+
+3. **Python query function** — `search_feedback(query, department, source)` wraps the API call. Supports filtering by department and source (so you can search only call transcripts, or only Engineering feedback).
+
+### Cost
+
+~$1.50 per 1,000 queries. For a portfolio demo, this is effectively free. Google also offers a $1,000 Vertex AI Search promo credit for new customers.
+
+The real cost to be aware of is data store indexing — when you connect BigQuery, it indexes your data. For ~1,400 records this is negligible, but on production-scale data (millions of records) it becomes a line item.
+
+*(Results, hiccups, and interview one-liners will be added after implementation)*
+
+---
+
 ## Running Themes
 
 ### Things that keep coming up
