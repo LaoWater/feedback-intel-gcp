@@ -396,14 +396,14 @@ We grant IAM roles one `gcloud` command at a time. That's fine for learning, but
 - Exploring WER results and plotting error distributions? Notebook.
 - Running the streaming pipeline 24/7? **Never a notebook.**
 
-**The CI/CD confusion:** Sometimes interviewers ask "do you use notebooks in your pipeline?" They might mean:
+**The CI/CD confusion:** "Do you use notebooks in your pipeline?" They might mean:
 1. **Notebook-based pipelines** (e.g., Papermill, Databricks notebooks) — runs notebooks as pipeline steps. Common in data science teams. Not what we're doing.
 2. **Notebooks for development** — write/test pipeline code in a notebook, then extract to `.py` for production. Reasonable workflow.
 3. **Notebooks as documentation** — a notebook showing pipeline results with visualizations. Good for stakeholder demos.
 
 **Our answer:** "We develop in Python files directly, not notebooks. The pipeline is a standard `.py` file deployable on Dataflow. If I needed to explore data or prototype a transform, I'd use a Vertex AI Workbench notebook, then move the logic to `pipeline.py` once it works."
 
-**Interview one-liner:** "Notebooks are for exploration, not production. I prototype in notebooks, promote to Python files, deploy on Dataflow. The notebook never runs in prod."
+**One-liner:** "Notebooks are for exploration, not production. Prototype in notebooks, promote to Python files, deploy on Dataflow. The notebook never runs in prod."
 
 ---
 
@@ -413,7 +413,7 @@ We grant IAM roles one `gcloud` command at a time. That's fine for learning, but
 
 ---
 
-## Interview One-Liners
+## Take-away One-Liners
 
 - "Apache Beam is the code. Dataflow is the runtime. Like Docker and Kubernetes."
 - "Pub/Sub is the shock absorber between ingestion and processing."
