@@ -15,10 +15,11 @@
 | 04 | NLP/Sentiment Enrichment | ✅ COMPLETE | 2026-03-11 |
 | 05 | Chirp Speech-to-Text Pipeline | ✅ COMPLETE | 2026-03-11 |
 | 06 | Evaluation & Iteration | ✅ COMPLETE | 2026-03-12 |
-| 07 | Vertex AI Search | ⬚ Not Started | — |
-| 08 | Looker Dashboard | ⬚ Not Started | — |
-| 09 | React Frontend + API | ⬚ Not Started | — |
-| 10 | Polish & Interview Prep | ⬚ Not Started | — |
+| 07 | Vertex AI Search | ✅ COMPLETE | 2026-03-13 |
+| 08 | Apache Beam + Dataflow Pipeline | 🔄 IN PROGRESS | — |
+| 09 | Looker Dashboard | ⬚ Not Started | — |
+| 10 | React Frontend + API | ⬚ Not Started | — |
+| 11 | Polish & Interview Prep | ⬚ Not Started | — |
 
 ---
 
@@ -240,22 +241,75 @@
 
 **Cost:** ~$1.50 per 1,000 queries. For a portfolio demo with ~50-100 queries, this is pennies. $300 GCP credit / $1,000 Vertex AI Search promo credit covers it.
 
-### Steps
-- [ ] Enable Discovery Engine API
-- [ ] Create data store connected to BigQuery `enriched_feedback`
-- [ ] Create search engine (app) on top of the data store
-- [ ] Write `search/search_feedback.py` — setup + query function
-- [ ] Test queries: "delivery complaints", "app crashes", "billing issues"
-- [ ] Test filters: department, source (calls vs text)
+### Completed Steps
+- [x] Discovery Engine API already enabled (Sprint 01)
+- [x] Create data store `feedback-store-v2` connected to BigQuery `enriched_feedback_search` view
+- [x] Create BigQuery view `enriched_feedback_search` (renames `id` → `_id` for Discovery Engine)
+- [x] Import 1,378 records from BigQuery into data store (custom schema, INCREMENTAL mode)
+- [x] Update schema: mark `text` as searchable, `department`/`source`/`sentiment` as indexable+filterable
+- [x] Create search engine `feedback-search-app-v2` (Enterprise tier + LLM add-on for AI summaries)
+- [x] Write `search/search_feedback.py` — setup + query function with CLI
+- [x] Test unfiltered query: "what are customers saying about login problems" — 10 results + AI summary with citations
+- [x] Test department filter: "app crashes" --department Engineering — 10 Engineering results
+- [x] Test source filter: "billing complaints" --source call — 5 call transcripts about billing
 
-### Done Criteria
-- Search returns relevant results with AI summary
-- Department and source filters work
-- Citations included in summaries
+### Key Metrics
+- **1,378 documents indexed** across 4 sources (ticket, review, survey, call)
+- **Semantic matching works**: "billing complaints" matches "charge on my invoice" (no keyword overlap)
+- **Cross-source search**: login query found both tickets AND call transcripts in one result set
+- **AI summaries**: synthesize 5 sources into coherent narrative with [1], [2] citations
+- **Filters**: department and source filtering work correctly
+
+### Issues Encountered & Resolved
+1. **`CONTENT_REQUIRED` vs `NO_CONTENT`** — Created data store with `CONTENT_REQUIRED` (for document stores like PDFs). Structured BigQuery data needs `NO_CONTENT` (the fields ARE the data). All 1,378 imports failed. Had to delete and recreate.
+2. **BigQuery `_id` field required** — Discovery Engine's `custom` schema requires an `_id` field as document identifier. Our table uses `id`. Fix: created a BigQuery view `enriched_feedback_search` that renames `id` → `_id`.
+3. **Fields not filterable by default** — Auto-detected schema doesn't mark fields as filterable. Filter query on `department` failed with "Unsupported field on : operator". Fix: explicit schema update marking `department`, `source`, `sentiment` as `indexable`.
+4. **Data store deletion takes hours** — Deleted the broken data store to recreate with correct config. Deletion took 12+ hours (GCP says "could take a couple of hours"). Fix: used new IDs (`feedback-store-v2`, `feedback-search-app-v2`) instead of waiting.
+5. **`AlreadyExists` exception handling** — gRPC exceptions need `google.api_core.exceptions.AlreadyExists`, not string matching on the error message.
+
+### Done Criteria — MET
+- ✅ Search returns relevant results with AI summary
+- ✅ Department and source filters work
+- ✅ Citations included in summaries
+- ✅ Cross-source search (text + call transcripts in one query)
 
 ---
 
-## Sprint 08 — Looker Dashboard
+## Sprint 08 — Apache Beam + Dataflow Pipeline
+
+**Goal:** Replace local-only processing with a real streaming pipeline. Pub/Sub → Apache Beam → BigQuery, deployable on Google Cloud Dataflow.
+
+**Full documentation:** See `Apache_Dataflow.MD` for concepts, all commands, costs, and replication guide.
+
+### Completed Steps
+- [x] Write `Apache_Dataflow.MD` — core concepts (Beam vs Dataflow, PCollection, DoFn, runners, streaming vs batch)
+- [x] Create Pub/Sub topic `feedback-raw` + subscription `feedback-raw-sub`
+- [x] Create GCS bucket `gs://feedback-intel-dataflow` (europe-west1) for Dataflow staging
+- [x] Write `pipeline/publish_feedback.py` — Pub/Sub publisher (simulates ingestion service)
+- [x] Write `pipeline/pipeline.py` — Apache Beam streaming pipeline (ParseMessage → ValidateRecord → FormatForBigQuery → WriteToBigQuery)
+- [x] Write `pipeline/requirements.txt` — apache-beam[gcp], google-cloud-pubsub
+- [ ] Install dependencies (`pip install -r pipeline/requirements.txt`)
+- [ ] Grant Dataflow IAM roles to service account
+- [ ] Test locally with DirectRunner
+- [ ] Deploy to Dataflow, verify, tear down
+- [ ] Update `Apache_Dataflow.MD` with hiccups and lessons
+
+### Key Design Decisions
+- **Separate DoFns for parse/validate/format** — Single Responsibility. Each step is testable, debuggable, and visible in the Dataflow monitoring UI.
+- **`CREATE_NEVER` write disposition** — Fail-fast if table schema is wrong. Don't silently create unpartitioned tables.
+- **`save_main_session=True`** — Ships Python globals (constants, imports) to remote Dataflow workers.
+- **`topic=` not `subscription=`** — Beam creates a temp subscription. The `feedback-raw-sub` is for manual debugging only.
+- **Cloud Function + Beam pipeline coexist** — Cloud Function handles batch CSV uploads, Beam handles real-time event streams. Same BigQuery destination.
+
+### Done Criteria
+- Pipeline runs locally with DirectRunner
+- Test message flows: publish → Pub/Sub → pipeline → BigQuery
+- Pipeline deploys to Dataflow (brief — verify and tear down)
+- All commands documented in `Apache_Dataflow.MD` for replication
+
+---
+
+## Sprint 09 — Looker Dashboard
 
 **Goal:** 4-view dashboard connected to BigQuery.
 
@@ -272,7 +326,7 @@
 
 ---
 
-## Sprint 09 — React Frontend + API
+## Sprint 10 — React Frontend + API
 
 **Goal:** FastAPI backend + React frontend deployed on Cloud Run.
 
@@ -289,7 +343,7 @@
 
 ---
 
-## Sprint 10 — Polish & Interview Prep
+## Sprint 11 — Polish & Interview Prep
 
 **Goal:** README, demo recording, talking points rehearsed.
 

@@ -295,7 +295,91 @@ Returns: AI summary with citations + top matching records
 
 The real cost to be aware of is data store indexing — when you connect BigQuery, it indexes your data. For ~1,400 records this is negligible, but on production-scale data (millions of records) it becomes a line item.
 
-*(Results, hiccups, and interview one-liners will be added after implementation)*
+### Results
+
+All three test queries returned semantically relevant results with AI-generated summaries:
+
+1. **"what are customers saying about login problems"** — 10 results across tickets AND call transcripts. The AI summary synthesized them into categories: login page refreshing, authentication errors affecting whole teams, mobile app login hanging, session timeout complaints. It cited 5 sources with [1]-[5] references.
+
+2. **"app crashes" filtered to Engineering** — 10 results, all correctly filtered to Engineering. The summary categorized by platform: mobile crashes when updating tasks, iOS crashes on project files, desktop crashes with large files. Keyword search would have found these, but the AI summary grouping them by scenario is the real value.
+
+3. **"billing complaints" filtered to call transcripts** — 5 call results about billing. The key moment: the query "billing complaints" matched transcripts that say "charge on my invoice" and "latest invoice" — zero keyword overlap. That's semantic understanding in action.
+
+### Hiccups: CONTENT_REQUIRED vs NO_CONTENT (the big one)
+
+Created the data store with `content_config=CONTENT_REQUIRED`. All 1,378 imports failed with: "To create document without content, content config must be NO_CONTENT."
+
+The distinction: `CONTENT_REQUIRED` is for **document stores** — PDFs, HTML pages, text blobs where the entire thing is "content." Our data is **structured** — each record has discrete fields (text, department, sentiment, etc.). For structured BigQuery data, you use `NO_CONTENT` because the individual fields ARE the data, not a single content blob.
+
+This isn't obvious from the docs. The naming is confusing: "NO_CONTENT" sounds like "no searchable content," but it actually means "I'm providing structured fields, not a content document."
+
+### Hiccup: BigQuery `_id` field requirement
+
+Discovery Engine's `custom` data schema requires a field literally named `_id` as the document identifier. Our BigQuery table uses `id`. The import silently failed on every record.
+
+Fix: created a BigQuery view `enriched_feedback_search` that simply renames `id → _id` and passes everything else through. Simple, but not documented clearly.
+
+### Hiccup: Fields not filterable by default
+
+After successful import, tried filtering: `--department Engineering`. Got: "Unsupported field 'department' on ':' operator."
+
+Vertex AI Search auto-detects your schema from BigQuery but doesn't know which fields should be filterable (indexed) vs searchable (text-matched) vs retrievable (returned in results). You have to explicitly update the schema with annotations: `indexable`, `searchable`, `retrievable`, `dynamicFacetable`.
+
+### Hiccup: Data store deletion takes 12+ hours
+
+Needed to delete and recreate the data store (to fix `CONTENT_REQUIRED` → `NO_CONTENT`). Google says deletion "could take a couple of hours." Actual time: still pending after 12 hours. Fix: used new IDs (`feedback-store-v2`, `feedback-search-app-v2`) and moved on. Pragmatic.
+
+### Interview one-liners
+
+- "Vertex AI Search is RAG-as-a-service — embeddings, indexing, retrieval, and summarization behind one API. No vector database to manage."
+- "For structured BigQuery data, use `NO_CONTENT` — not `CONTENT_REQUIRED`. The naming is counterintuitive: NO_CONTENT means 'structured fields,' not 'nothing to search.'"
+- "Semantic search matched 'billing complaints' to transcripts saying 'charge on my invoice' — zero keyword overlap. That's the difference between LIKE and embeddings."
+- "Every field needs explicit schema annotations: indexable for filters, searchable for text matching, retrievable to appear in results. Auto-detect only gets the types right."
+- "Data store deletion can take half a day. Use new IDs and move on."
+
+---
+
+## Sprint 08 — Apache Beam + Dataflow Pipeline
+
+**What we're building:** A real streaming pipeline that replaces local script execution. Feedback events flow through Pub/Sub into an Apache Beam pipeline that parses, validates, and writes to BigQuery — deployable on Google Cloud Dataflow as a continuously running managed job.
+
+**Full reference:** `Apache_Dataflow.MD` has all concepts, commands, costs, and replication steps.
+
+### The "why" — answering the production question
+
+Before this sprint, the honest answer to "how does your pipeline run?" was: "I run Python scripts on my laptop." That's fine for development, but it's not a production story. The Cloud Function (Sprint 03) handles CSV batch uploads, but real-time feedback events had no processing path.
+
+Now we have two ingestion patterns:
+1. **Batch:** CSV upload → Cloud Function → BigQuery (event-driven, file-level)
+2. **Streaming:** API/webhook → Pub/Sub → Beam pipeline → BigQuery (continuous, message-level)
+
+Both feed the same `raw_feedback` table. Different patterns, same destination.
+
+### Key architectural choice: Beam over Cloud Functions for streaming
+
+Why not just deploy another Cloud Function that subscribes to Pub/Sub?
+
+| | Cloud Function | Beam on Dataflow |
+|---|---|---|
+| Scaling | Per-invocation (one function per message) | Distributed workers (batch internally) |
+| State | Stateless (each invocation independent) | Can maintain state across messages (windows, aggregations) |
+| Cost model | Per invocation ($0.40/million) | Per worker-hour (~$0.056/hr/vCPU) |
+| Best for | Low-volume, simple transforms | High-volume, complex multi-step processing |
+| Portability | GCP-only | Beam runs on Flink, Spark, Dataflow |
+
+For our demo volume, either works. But Beam demonstrates production-grade data engineering: distributed processing, windowing capability, runner portability, and managed auto-scaling.
+
+### The Beam pipeline design
+
+Three separate DoFns, each doing one thing:
+
+1. **ParseMessage** — bytes → JSON. Handles decode errors without crashing.
+2. **ValidateRecord** — checks required fields. Bad records are logged, not dropped silently.
+3. **FormatForBigQuery** — shapes the dict to match BQ schema. Serializes metadata to JSON string.
+
+Why not one big function? Each step shows up separately in the Dataflow monitoring UI. If validation is rejecting 50% of messages, you see it immediately. If BigQuery writes are slow, you see the bottleneck. Single Responsibility isn't just clean code — it's observability.
+
+*(Hiccups and interview one-liners will be added after running the pipeline)*
 
 ---
 
@@ -309,6 +393,9 @@ The real cost to be aware of is data store indexing — when you connect BigQuer
 - **Model feature matrices matter.** Chirp 2 vs 3, Gemini Flash vs Flash Lite — each model has specific feature support. Always check the docs before writing code. Don't assume a newer model supports everything the older one did.
 - **Synthetic data has hard evaluation limits.** You can evaluate the pipeline (does signal survive TTS→STT→classification?) but you can't evaluate the classifier itself without real labeled data. Know the difference. Build the framework, don't fake the metrics.
 - **Taxonomy mismatches surface in evaluation.** Your data and your classifier might use different categories. Evaluation is when you find out. Document it, don't hide it.
+- **Beam is the code, Dataflow is the runtime.** Same pipeline.py runs locally (DirectRunner) or on managed workers (DataflowRunner). The runner is a CLI flag, not a code change. This is the portability promise.
+- **GCP naming is counterintuitive.** `NO_CONTENT` means "structured fields" not "nothing to search." `CONTENT_REQUIRED` means "document blob" not "must have content." Read the enum values, not the names.
+- **GCP deletions are slow.** Data store deletion took 12+ hours. Don't wait — use new IDs and move on. This pattern applies to many GCP resources.
 
 ### Interview-ready one-liners
 - "Gen2 Cloud Functions are Cloud Run + Eventarc + Pub/Sub. You're debugging three systems."
@@ -318,3 +405,9 @@ The real cost to be aware of is data store indexing — when you connect BigQuer
 - "WER is the standard metric for STT accuracy. Ours was 4% on synthetic audio — realistic floor, not ceiling."
 - "You can't evaluate an LLM classifier on LLM-generated data. The evaluation framework matters more than fake metrics."
 - "We found a taxonomy mismatch during evaluation — 6 departments in the data, 4 in the classifier. That's the kind of thing evaluation is for."
+- "Apache Beam is the code, Dataflow is the runtime — like Docker and Kubernetes."
+- "Cloud Function for batch file uploads, Beam pipeline for real-time event streams. Same BigQuery destination, different patterns."
+- "Pub/Sub is the shock absorber between ingestion and processing. Decouples producers from consumers."
+- "Vertex AI Search is RAG-as-a-service — embeddings, indexing, retrieval, and summarization behind one API."
+- "Semantic search matched 'billing complaints' to 'charge on my invoice' — zero keyword overlap. That's embeddings vs LIKE."
+- "For structured BigQuery data use NO_CONTENT, not CONTENT_REQUIRED. The naming is backwards."
