@@ -379,7 +379,61 @@ Three separate DoFns, each doing one thing:
 
 Why not one big function? Each step shows up separately in the Dataflow monitoring UI. If validation is rejecting 50% of messages, you see it immediately. If BigQuery writes are slow, you see the bottleneck. Single Responsibility isn't just clean code — it's observability.
 
-*(Hiccups and interview one-liners will be added after running the pipeline)*
+### Hiccups
+
+1. **`yield` + bare `return` in DoFn.** Beam warned about mixing yield and return in `ValidateRecord.process()`. Python treats a function with `yield` as a generator — a bare `return` becomes `StopIteration`, which is fine syntactically but confuses Beam's DoFn runner. Fix: use `if/else` to either yield or not. Never mix.
+
+2. **DirectRunner + Pub/Sub streaming = gRPC hang.** Running the pipeline in streaming mode locally hung with "Waiting for grpc channel to be ready at localhost:XXXXX." DirectRunner's portable runner framework can't start the local gRPC server reliably (especially Windows). Fix: `--local` flag with `beam.Create()` for testing. Use DataflowRunner for real streaming.
+
+3. **FILE_LOADS needs GCS, STREAMING_INSERTS doesn't.** Local batch mode defaulted to FILE_LOADS (write to GCS temp, then bulk load). Failed with "Invalid GCS location: None." Fix: explicitly set `method=STREAMING_INSERTS` in local mode — bypasses GCS entirely. In streaming mode on Dataflow, Beam uses STREAMING_INSERTS automatically.
+
+---
+
+## Sprint 09 — Looker Studio Dashboard
+
+**What we're building:** A BI dashboard that makes 1,402 classified feedback records explorable. Stakeholders pick a department, see sentiment breakdown, top issues, call vs text comparison — all without writing SQL.
+
+### The "why" — data without a dashboard is a report nobody reads
+
+We have enriched data, materialized views, even semantic search. But none of that is self-serve. A product manager shouldn't need to write SQL to see "what are customers complaining about this week?" Looker Studio is Google's free BI tool — it connects directly to BigQuery with zero data movement.
+
+### The real work: BigQuery views, not the dashboard itself
+
+Looker Studio is drag-and-drop UI. The engineering work is preparing the data so the UI can consume it. Three problems Looker can't solve on its own:
+
+**1. ARRAY columns (key_issues)**
+`enriched_feedback.key_issues` is a `REPEATED STRING` — an array. Looker Studio can't query arrays directly. You can't make a bar chart of "top issues" when each row contains multiple issues in an array.
+
+Solution: `dashboard_view` uses `CROSS JOIN UNNEST(key_issues) AS issue` — explodes each array into separate rows. A record with 3 issues becomes 3 rows. The view went from 1,402 rows to ~4,200. This is the standard pattern for denormalizing arrays for BI tools.
+
+**2. Aggregating call pipeline health**
+`call_transcripts` has per-call metrics (duration, confidence, processing time). Looker can aggregate these, but you'd need calculated fields for success rate, average confidence by date, etc. Easier to pre-compute.
+
+Solution: `call_analytics` view aggregates by date — calls transcribed, success rate, average Chirp confidence, negative/positive sentiment split. One row per day, ready for time-series charts.
+
+**3. Source comparison (text vs calls)**
+Comparing feedback sources requires a GROUP BY across source × department with derived metrics (negative rate, average confidence). Doable in Looker but fragile to set up.
+
+Solution: `source_comparison` view pre-computes the pivot — 16 rows (8 departments × 2 sources), each with count, avg confidence, and negative rate.
+
+### Views vs direct table queries — the trade-off
+
+| | Direct table | View | Materialized view |
+|---|---|---|---|
+| Storage cost | — | Free (no data stored) | Stores result set |
+| Query cost | Full scan | Full scan (view is just saved SQL) | Reads cached result |
+| Freshness | Real-time | Real-time | Refresh interval |
+| Best for | Ad-hoc queries | BI tools, denormalization | Time-series aggregations |
+
+We use regular views for `dashboard_view`, `call_analytics`, and `source_comparison` — our data is small (1,402 rows), so scan cost is effectively $0.00. The existing `daily_summary` is a materialized view because it aggregates by date/department/sentiment, and that pattern benefits from caching as data grows.
+
+**Rule of thumb:** Regular views for small or frequently-changing data. Materialized views for expensive aggregations on large, append-mostly tables.
+
+### Interview one-liners
+
+- "Looker Studio can't UNNEST arrays — you need a BigQuery view that CROSS JOINs the array into rows. Standard BI denormalization pattern."
+- "Regular views are free but re-scan every query. Materialized views cache results but cost storage. At 1,400 rows, regular views are the right call."
+- "The dashboard engineering isn't the charts — it's preparing BigQuery views so a drag-and-drop tool can consume complex data structures."
 
 ---
 
@@ -396,6 +450,7 @@ Why not one big function? Each step shows up separately in the Dataflow monitori
 - **Beam is the code, Dataflow is the runtime.** Same pipeline.py runs locally (DirectRunner) or on managed workers (DataflowRunner). The runner is a CLI flag, not a code change. This is the portability promise.
 - **GCP naming is counterintuitive.** `NO_CONTENT` means "structured fields" not "nothing to search." `CONTENT_REQUIRED` means "document blob" not "must have content." Read the enum values, not the names.
 - **GCP deletions are slow.** Data store deletion took 12+ hours. Don't wait — use new IDs and move on. This pattern applies to many GCP resources.
+- **BI tools can't handle raw data structures.** Arrays, nested fields, cross-table aggregations — all need pre-computed views. The engineering is in the views, not the charts.
 
 ### Interview-ready one-liners
 - "Gen2 Cloud Functions are Cloud Run + Eventarc + Pub/Sub. You're debugging three systems."
@@ -411,3 +466,5 @@ Why not one big function? Each step shows up separately in the Dataflow monitori
 - "Vertex AI Search is RAG-as-a-service — embeddings, indexing, retrieval, and summarization behind one API."
 - "Semantic search matched 'billing complaints' to 'charge on my invoice' — zero keyword overlap. That's embeddings vs LIKE."
 - "For structured BigQuery data use NO_CONTENT, not CONTENT_REQUIRED. The naming is backwards."
+- "Looker can't query REPEATED fields — CROSS JOIN UNNEST into a view. Standard BI denormalization."
+- "Regular views for small data, materialized views for expensive aggregations. Know the trade-off."

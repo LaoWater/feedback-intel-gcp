@@ -195,29 +195,32 @@ gcloud pubsub subscriptions pull feedback-raw-sub --auto-ack --limit=5
 ```
 **Cost:** Free (Pub/Sub free tier covers first 10 GB/month).
 
-### Step 7: Run the Pipeline Locally (DirectRunner)
+### Step 7: Test Locally (DirectRunner, batch mode)
 
 ```bash
-# This runs on your laptop — free, no GCP workers
-python pipeline/pipeline.py
+# Runs 3 test messages (2 valid + 1 invalid) through the full transform chain
+# Same DoFns as production — just fed from beam.Create() instead of Pub/Sub
+python pipeline/pipeline.py --local
 ```
-The pipeline will start and wait for Pub/Sub messages. In a **second terminal**:
+
+You'll see logs showing which messages passed validation and which were rejected. Valid records are written to BigQuery.
+
 ```bash
-# Publish a test message
-python pipeline/publish_feedback.py --test
+# Or test with a specific JSON message
+python pipeline/pipeline.py --local --input '{"id":"custom-test","source":"manual","text":"Testing a custom message","created_at":"2026-03-13T12:00:00Z"}'
 ```
 
 **Verify in BigQuery:**
 ```sql
 SELECT * FROM feedback.raw_feedback
-WHERE id LIKE 'beam-test-%'
+WHERE id LIKE 'beam-local-%'
 ORDER BY created_at DESC
 LIMIT 5;
 ```
 
-**Stop the pipeline:** `Ctrl+C` in the first terminal.
+**Cost:** $0.00 — DirectRunner is local-only. BigQuery writes are free (streaming inserts).
 
-**Cost:** $0.00 — DirectRunner is local-only.
+**Why not streaming locally?** DirectRunner + streaming Pub/Sub I/O has known gRPC issues (see Implementation Notes). The production pattern: test transforms locally in batch, test streaming on Dataflow.
 
 ### Step 8: Deploy to Dataflow (Production Runner)
 
@@ -409,7 +412,84 @@ We grant IAM roles one `gcloud` command at a time. That's fine for learning, but
 
 ## Implementation Notes
 
-*(filled in after running — hiccups, gotchas, fixes)*
+### Hiccup: `yield` + `return` in a DoFn
+
+**Warning:** `Using yield and return in the process method of ValidateRecord can lead to unexpected behavior`
+
+Our `ValidateRecord.process()` used `yield record` for valid records and `return` for invalid ones. Beam flags this because `process()` is a Python generator — mixing `yield` and bare `return` in a generator can cause `StopIteration` to fire unexpectedly, silently dropping elements.
+
+**Fix:** Replace `return` with `if/else` — either yield or don't. Never use bare `return` in a DoFn that yields.
+
+```python
+# BAD — mixing yield and return
+def process(self, record):
+    if bad:
+        return          # StopIteration risk
+    yield record
+
+# GOOD — if/else, no bare return
+def process(self, record):
+    if bad:
+        pass            # don't yield = record filtered out
+    else:
+        yield record
+```
+
+**Lesson:** DoFn.process() is a generator. Treat it like one — control flow with `yield` only, never `return`.
+
+### Hiccup: DirectRunner + Streaming Pub/Sub = gRPC timeout
+
+Running `python pipeline/pipeline.py` (streaming mode with DirectRunner) hangs with:
+```
+WARNING:root:Waiting for grpc channel to be ready at localhost:XXXXX
+```
+
+**Why:** DirectRunner uses the "portable" runner framework for streaming Pub/Sub I/O. This requires spinning up a local gRPC server (the SDK harness). On Windows especially, this often fails to initialize — it's a known limitation.
+
+**The real lesson:** DirectRunner is designed for **batch** testing. Streaming Pub/Sub I/O is built for **DataflowRunner**. This isn't a bug — it's a design boundary.
+
+**The production pattern:**
+1. **Test transforms locally** — `--local` flag, uses `beam.Create()` to feed test data through the same DoFns, writes to real BigQuery. Proves your business logic works.
+2. **Test streaming on Dataflow** — deploy with `--runner DataflowRunner`, publish via Pub/Sub, verify end-to-end. This is where streaming actually runs.
+
+This is how real teams work: unit test transforms locally, integration test on Dataflow. You don't run a streaming pipeline on your laptop in production.
+
+**Fix:** Added `--local` mode to `pipeline.py`:
+```bash
+# Local batch test (free, fast, proves transforms work)
+python pipeline/pipeline.py --local
+
+# Production streaming (Dataflow workers, costs money)
+python pipeline/pipeline.py --runner DataflowRunner ...
+```
+
+**Interview one-liner:** "DirectRunner is for batch testing transforms. Streaming Pub/Sub runs on Dataflow. We test locally with beam.Create(), deploy streaming to Dataflow — same DoFns, different source."
+
+### Hiccup: FILE_LOADS vs STREAMING_INSERTS in batch mode
+
+Running `python pipeline/pipeline.py --local` failed with:
+```
+ValueError: Invalid GCS location: None.
+Writing to BigQuery with FILE_LOADS method requires a GCS location...
+```
+
+**Why:** Beam has two BigQuery write methods:
+| Method | How it works | When Beam uses it |
+|---|---|---|
+| `FILE_LOADS` | Writes to GCS temp files → bulk loads into BQ | **Default in batch mode** |
+| `STREAMING_INSERTS` | Sends rows directly to BQ streaming API | **Default in streaming mode** |
+
+Our local mode is batch (no Pub/Sub), so Beam defaulted to FILE_LOADS — which needs a GCS bucket for temp files. We didn't provide one because we're running locally.
+
+**Fix:** Explicitly set `method=beam.io.WriteToBigQuery.Method.STREAMING_INSERTS` in local mode. This sends rows directly to BigQuery without needing GCS.
+
+**The deeper lesson:** Beam's BigQuery I/O behaves differently in batch vs streaming. In production (Dataflow streaming), it auto-selects STREAMING_INSERTS. In batch, it prefers FILE_LOADS for efficiency (bulk loads are free, streaming inserts cost $0.01/200MB). For local testing, streaming inserts are simpler — no temp bucket needed.
+
+**Interview one-liner:** "Beam's BigQuery write defaults to FILE_LOADS in batch (needs GCS) and STREAMING_INSERTS in streaming. Know which mode you're in."
+
+### Note: `crcmod` warning
+
+`crcmod package not found` — harmless. It's an optional CRC checksum library for GCS transfers. Only matters for large file I/O, not Pub/Sub messages. Ignore it or `pip install crcmod` to silence.
 
 ---
 
@@ -425,3 +505,4 @@ We grant IAM roles one `gcloud` command at a time. That's fine for learning, but
 - "ReadFromPubSub with topic= creates a temp subscription. With subscription= you manage it yourself. We use topic= for simplicity."
 - "IAM grants are captured in a single bash script — replicable from scratch. In production, Terraform for state tracking and drift detection."
 - "Notebooks are for exploration, not production. Prototype in notebooks, promote to .py, deploy on Dataflow."
+- "DirectRunner is for batch testing transforms. Streaming Pub/Sub runs on Dataflow. Test locally with beam.Create(), deploy streaming to Dataflow."

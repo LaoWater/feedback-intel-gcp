@@ -17,10 +17,13 @@ Architecture:
         └─ invalid ────────▶ LogBadRecord (DoFn) → print/log
 
 Usage:
-    # Local testing (free, runs on your laptop)
-    python pipeline/pipeline.py
+    # Local test (batch mode — proves transforms work, free)
+    python pipeline/pipeline.py --local
 
-    # Dataflow deployment (costs money — workers run continuously)
+    # Local test with custom JSON input
+    python pipeline/pipeline.py --local --input '{"id":"x","source":"manual","text":"test","created_at":"2026-03-13T12:00:00Z"}'
+
+    # Dataflow deployment (streaming mode — costs money, runs continuously)
     python pipeline/pipeline.py \
         --runner DataflowRunner \
         --project feedback-intel-demo \
@@ -31,8 +34,11 @@ Usage:
 
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
+import argparse
 import json
 import logging
+import uuid
+from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -68,7 +74,11 @@ class ParseMessage(beam.DoFn):
 
     def process(self, element):
         try:
-            record = json.loads(element.decode("utf-8"))
+            # Handle both bytes (from Pub/Sub) and str (from local test)
+            if isinstance(element, bytes):
+                record = json.loads(element.decode("utf-8"))
+            else:
+                record = json.loads(element) if isinstance(element, str) else element
             yield record
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.warning(f"Failed to parse message: {e}")
@@ -90,9 +100,9 @@ class ValidateRecord(beam.DoFn):
             logger.warning(
                 f"Rejected record {record.get('id', '?')}: missing {missing}"
             )
-            return  # yields nothing — record is filtered out
-
-        yield record
+            # Don't yield — record is filtered out
+        else:
+            yield record
 
 
 class FormatForBigQuery(beam.DoFn):
@@ -116,51 +126,145 @@ class FormatForBigQuery(beam.DoFn):
         yield row
 
 
+def build_test_messages():
+    """Generate test messages for local pipeline runs."""
+    return [
+        json.dumps({
+            "id": f"beam-local-{uuid.uuid4().hex[:8]}",
+            "source": "manual",
+            "text": "The checkout page throws a 500 error when applying discount codes.",
+            "customer_id": "cust_test_001",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": {"test": True, "sprint": "08-beam-pipeline"},
+        }),
+        json.dumps({
+            "id": f"beam-local-{uuid.uuid4().hex[:8]}",
+            "source": "review",
+            "text": "Love the new dashboard design, much faster than before!",
+            "customer_id": "cust_test_002",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": {"test": True},
+        }),
+        # Invalid record — missing 'text' field, should be rejected
+        json.dumps({
+            "id": f"beam-local-{uuid.uuid4().hex[:8]}",
+            "source": "survey",
+            "customer_id": "cust_test_003",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }),
+    ]
+
+
 def run():
-    # Pipeline options — streaming mode is the key difference from batch
+    # Parse our custom args separately from Beam's pipeline args
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--local", action="store_true",
+                        help="Run locally in batch mode (bypasses Pub/Sub)")
+    parser.add_argument("--input", type=str,
+                        help="JSON string to process in local mode")
+    known_args, pipeline_args = parser.parse_known_args()
+
     options = PipelineOptions(
-        # save_main_session=True serializes global state (imports, constants)
-        # so remote Dataflow workers can access them
+        pipeline_args,
         save_main_session=True,
     )
 
-    # Enable streaming mode — the pipeline runs continuously
-    options.view_as(StandardOptions).streaming = True
+    if known_args.local:
+        # ============================================================
+        # LOCAL MODE — batch, no Pub/Sub, no streaming
+        # ============================================================
+        # Tests that your DoFns work correctly.
+        # Same transforms, different source (in-memory vs Pub/Sub).
+        # This is the standard pattern: test transforms locally,
+        # deploy the full pipeline on Dataflow.
+        # ============================================================
+        logger.info("Running in LOCAL mode (batch, DirectRunner)")
 
-    with beam.Pipeline(options=options) as p:
-        # Read raw bytes from Pub/Sub
-        # Note: topic= makes Beam create its own subscription
-        # This is different from subscription= which reads an existing one
-        messages = (
-            p
-            | "ReadFromPubSub"
-            >> beam.io.ReadFromPubSub(topic=TOPIC)
-        )
+        if known_args.input:
+            test_data = [known_args.input]
+        else:
+            test_data = build_test_messages()
 
-        # Parse, validate, format, write
-        (
-            messages
-            | "ParseJSON"
-            >> beam.ParDo(ParseMessage())
+        logger.info(f"Processing {len(test_data)} test messages...")
 
-            | "ValidateRecord"
-            >> beam.ParDo(ValidateRecord())
+        with beam.Pipeline(options=options) as p:
+            results = (
+                p
+                | "CreateTestData"
+                >> beam.Create(test_data)
 
-            | "FormatForBigQuery"
-            >> beam.ParDo(FormatForBigQuery())
+                | "ParseJSON"
+                >> beam.ParDo(ParseMessage())
 
-            | "WriteToBigQuery"
-            >> beam.io.WriteToBigQuery(
+                | "ValidateRecord"
+                >> beam.ParDo(ValidateRecord())
+
+                | "FormatForBigQuery"
+                >> beam.ParDo(FormatForBigQuery())
+            )
+
+            # Write to BigQuery (same as production)
+            # NOTE: In batch mode, Beam defaults to FILE_LOADS (write to GCS,
+            # then bulk load). That requires a GCS temp bucket. We force
+            # STREAMING_INSERTS here to avoid needing a temp location for
+            # local testing. In streaming mode (Dataflow), Beam uses
+            # STREAMING_INSERTS automatically.
+            results | "WriteToBigQuery" >> beam.io.WriteToBigQuery(
                 table=TABLE,
                 schema=TABLE_SCHEMA,
-                # WRITE_APPEND: add rows to existing table (don't overwrite)
                 write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
-                # CREATE_NEVER: table must already exist — fail-fast if schema is wrong
                 create_disposition=beam.io.BigQueryDisposition.CREATE_NEVER,
+                method=beam.io.WriteToBigQuery.Method.STREAMING_INSERTS,
             )
-        )
 
-    logger.info("Pipeline finished.")
+            # Also log to console so you can see what's happening
+            results | "LogResults" >> beam.Map(
+                lambda row: logger.info(f"  → BQ: {row['id']} ({row['source']}) - {row['text'][:60]}...")
+            )
+
+        logger.info("Local pipeline finished. Check BigQuery for results.")
+
+    else:
+        # ============================================================
+        # STREAMING MODE — reads from Pub/Sub continuously
+        # ============================================================
+        # This is the production path. Runs on DirectRunner (dev) or
+        # DataflowRunner (prod). Processes messages as they arrive.
+        #
+        # NOTE: DirectRunner streaming with Pub/Sub has known issues
+        # (gRPC channel timeouts). Use DataflowRunner for real streaming.
+        # ============================================================
+        options.view_as(StandardOptions).streaming = True
+        logger.info("Running in STREAMING mode (Pub/Sub → BigQuery)")
+
+        with beam.Pipeline(options=options) as p:
+            messages = (
+                p
+                | "ReadFromPubSub"
+                >> beam.io.ReadFromPubSub(topic=TOPIC)
+            )
+
+            (
+                messages
+                | "ParseJSON"
+                >> beam.ParDo(ParseMessage())
+
+                | "ValidateRecord"
+                >> beam.ParDo(ValidateRecord())
+
+                | "FormatForBigQuery"
+                >> beam.ParDo(FormatForBigQuery())
+
+                | "WriteToBigQuery"
+                >> beam.io.WriteToBigQuery(
+                    table=TABLE,
+                    schema=TABLE_SCHEMA,
+                    write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
+                    create_disposition=beam.io.BigQueryDisposition.CREATE_NEVER,
+                )
+            )
+
+        logger.info("Pipeline finished.")
 
 
 if __name__ == "__main__":

@@ -16,8 +16,8 @@
 | 05 | Chirp Speech-to-Text Pipeline | ✅ COMPLETE | 2026-03-11 |
 | 06 | Evaluation & Iteration | ✅ COMPLETE | 2026-03-12 |
 | 07 | Vertex AI Search | ✅ COMPLETE | 2026-03-13 |
-| 08 | Apache Beam + Dataflow Pipeline | 🔄 IN PROGRESS | — |
-| 09 | Looker Dashboard | ⬚ Not Started | — |
+| 08 | Apache Beam + Dataflow Pipeline | ✅ COMPLETE | 2026-03-13 |
+| 09 | Looker Dashboard | 🔄 IN PROGRESS | — |
 | 10 | React Frontend + API | ⬚ Not Started | — |
 | 11 | Polish & Interview Prep | ⬚ Not Started | — |
 
@@ -288,11 +288,11 @@
 - [x] Write `pipeline/publish_feedback.py` — Pub/Sub publisher (simulates ingestion service)
 - [x] Write `pipeline/pipeline.py` — Apache Beam streaming pipeline (ParseMessage → ValidateRecord → FormatForBigQuery → WriteToBigQuery)
 - [x] Write `pipeline/requirements.txt` — apache-beam[gcp], google-cloud-pubsub
-- [ ] Install dependencies (`pip install -r pipeline/requirements.txt`)
-- [ ] Grant Dataflow IAM roles to service account
-- [ ] Test locally with DirectRunner
-- [ ] Deploy to Dataflow, verify, tear down
-- [ ] Update `Apache_Dataflow.MD` with hiccups and lessons
+- [x] Install dependencies (`pip install -r pipeline/requirements.txt`)
+- [x] Grant Dataflow IAM roles to service account (dataflow.worker, dataflow.admin)
+- [x] Test locally with DirectRunner (`--local` batch mode) — 2/3 records written to BigQuery, 1 invalid rejected
+- [ ] Deploy to Dataflow (deferred — documented in Apache_Dataflow.MD Steps 8-10, ready to run)
+- [x] Update `Apache_Dataflow.MD` with 3 hiccups: yield+return in DoFn, gRPC timeout on DirectRunner streaming, FILE_LOADS vs STREAMING_INSERTS
 
 ### Key Design Decisions
 - **Separate DoFns for parse/validate/format** — Single Responsibility. Each step is testable, debuggable, and visible in the Dataflow monitoring UI.
@@ -311,17 +311,89 @@
 
 ## Sprint 09 — Looker Dashboard
 
-**Goal:** 4-view dashboard connected to BigQuery.
+**Goal:** 4-page BI dashboard connected to BigQuery via Looker Studio (free).
 
-### Steps
-- [ ] Create BigQuery views: `dashboard_view`, `call_analytics`, `source_comparison`
-- [ ] Connect Looker Studio to BigQuery
-- [ ] Build 4 views: Overview, Department Drill-down, Call Analytics, Confidence Monitor
-- [ ] Add filters: date range, department, source, sentiment
+**Pre-existing:** Materialized view `daily_summary` (auto-refreshing, created in Sprint 01).
+
+### Completed Steps
+- [x] Create view `dashboard_view` — UNNESTs `key_issues` array so Looker can query individual issues
+- [x] Create view `call_analytics` — Chirp pipeline health: transcription counts, avg duration, sentiment breakdown
+- [x] Create view `source_comparison` — Text vs calls by department: volume, confidence, negative rate
+- [x] Verify all views return correct data
+- [ ] Connect Looker Studio to BigQuery (UI step — see guide below)
+- [ ] Build 4 dashboard pages (UI step — see guide below)
+
+### BigQuery Data Sources for Looker
+
+| Source | Type | Rows | Use |
+|--------|------|------|-----|
+| `enriched_feedback` | Table | 1,402 | Main data source — all classified feedback |
+| `daily_summary` | Materialized view | ~30 | Time-series charts (pre-aggregated) |
+| `dashboard_view` | View | ~4,200 | Issue analysis (one row per issue per record) |
+| `call_analytics` | View | 1 | Call pipeline KPIs |
+| `source_comparison` | View | 16 | Channel comparison table |
+
+### Looker Studio Setup Guide
+
+**Step 1: Create Report**
+1. Go to [lookerstudio.google.com](https://lookerstudio.google.com)
+2. Click "Create" → "Report"
+3. "Add data" → BigQuery connector → project `feedback-intel-demo` → dataset `feedback`
+
+**Step 2: Add Data Sources** (add each as a separate data source)
+- `enriched_feedback` — main source for most charts
+- `daily_summary` — for time-series (already aggregated = fast)
+- `dashboard_view` — for issue breakdowns
+- `source_comparison` — for channel comparison table
+
+**Step 3: Build Page 1 — Overview**
+| Chart Type | Data Source | Dimension | Metric | Notes |
+|-----------|-------------|-----------|--------|-------|
+| Scorecard | enriched_feedback | — | COUNT(*) | "Total Feedback" |
+| Scorecard | enriched_feedback | — | AVG(confidence) | "Avg Confidence" |
+| Scorecard | enriched_feedback | — | COUNTIF(source='call') | "Calls Transcribed" |
+| Pie chart | enriched_feedback | sentiment | COUNT(*) | Sentiment split |
+| Bar chart | enriched_feedback | department | COUNT(*) | Volume by department |
+| Time series | daily_summary | date | SUM(count) | Feedback over time |
+
+**Filters:** date range, department, source, sentiment (add as dropdown controls)
+
+**Step 4: Build Page 2 — Department Drill-down**
+| Chart Type | Data Source | Dimension | Metric |
+|-----------|-------------|-----------|--------|
+| Bar chart | dashboard_view | issue | COUNT(*) | Top issues (filter by department) |
+| Stacked bar | enriched_feedback | department | COUNT(*) grouped by sentiment |
+| Table | enriched_feedback | id, text, sentiment, confidence | Detail drill-down |
+
+**Filter:** Department dropdown (controls all charts on this page)
+
+**Step 5: Build Page 3 — Call Analytics**
+| Chart Type | Data Source | Dimension | Metric |
+|-----------|-------------|-----------|--------|
+| Scorecard | call_analytics | — | calls_transcribed, successful, avg_duration_s |
+| Bar chart | source_comparison | source | negative_rate | Call vs text negative rate |
+| Table | source_comparison | source, department | count, avg_classification_confidence, negative_rate |
+
+**Step 6: Build Page 4 — Confidence Monitor**
+| Chart Type | Data Source | Dimension | Metric |
+|-----------|-------------|-----------|--------|
+| Histogram | enriched_feedback | confidence | COUNT(*) | Confidence distribution |
+| Table | enriched_feedback (filtered: confidence < 0.8) | id, text, department, confidence | Low-confidence items for review |
+| Bar chart | source_comparison | source | avg_classification_confidence | Confidence by channel |
+
+**Step 7: Share**
+- Click "Share" → "Get link" → "Anyone with the link can view"
+- Copy the URL — this is your portfolio demo link
+
+### Key Design Decisions
+- **Views vs direct tables** — Looker Studio can't UNNEST arrays or do complex JOINs inline. Views pre-shape the data so Looker just reads rows.
+- **Materialized view for time-series** — `daily_summary` is pre-aggregated by BigQuery. Time-series charts load in <1s instead of scanning 1,402 rows per filter change.
+- **Regular views for everything else** — 1,402 rows is tiny. Regular views (computed on query) are fine. Materialized views add cost/complexity we don't need here.
+- **Separate data sources per view** — Looker Studio doesn't blend data sources well. Each chart uses one source. The views are designed to be self-contained.
 
 ### Done Criteria
 - Dashboard shareable via link
-- All 4 views working with real data
+- All 4 pages working with real data
 - Filters responsive, loads in <5 seconds
 
 ---
