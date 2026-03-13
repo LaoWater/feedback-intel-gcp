@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Audio files (generated, large)
+*.wav
+*.mp3
+*.flac
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude Code
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Generated data (reproducible via scripts)
+data/calls/
+data/ground_truth/
+data/call_manifest.json
+data/seed_feedback.csv
+
+# Evaluation output
+evaluation/wer_results.csv
+
+# Test files
+test_upload.csv
