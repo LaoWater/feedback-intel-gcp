@@ -32,8 +32,8 @@ from google.cloud import discoveryengine
 PROJECT_ID = "feedback-intel-demo"
 LOCATION = "global"                  # Vertex AI Search uses global endpoint
 COLLECTION = "default_collection"
-DATA_STORE_ID = "feedback-store"
-ENGINE_ID = "feedback-search-app"
+DATA_STORE_ID = "feedback-store-v2"
+ENGINE_ID = "feedback-search-app-v2"
 
 # BigQuery source
 # Vertex AI Search requires an '_id' field for custom schema.
