@@ -1,7 +1,7 @@
 # feedback-intel — Documenting Progress
 
 > The story of building a GCP customer feedback intelligence platform.
-> High-level decisions, hiccups, and lessons — the stuff interviews are made of.
+> High-level decisions, hiccups, and lessons learned across 11 sprints.
 
 ---
 
@@ -159,7 +159,7 @@ We used streaming for convenience, but batch loads would have been smarter for E
 - The wildcard recognizer `projects/{project}/locations/{location}/recognizers/_` avoids needing to pre-create a recognizer resource.
 - `AutoDetectDecodingConfig` handles any sample rate automatically (our TTS was 24kHz, Chirp handles it).
 
-**Interview one-liners:**
+**Key takeaways:**
 - "Chirp 2 has better word-level metrics but no diarization. Chirp 3 adds diarization but drops word confidence. Choose based on whether you need speaker separation."
 - "I used streaming inserts for speed but learned about the 30-min DML buffer. In production, batch loads are free and support immediate mutations."
 - "Chirp is the model, STT V2 is the API — same pattern as Gemini and Vertex AI."
@@ -177,7 +177,7 @@ We used streaming for convenience, but batch loads would have been smarter for E
 **Hiccup: Stale error rows survive re-runs.**
 The transcription script logs error rows to BigQuery (so we don't retry failed files forever). But when we DROP + CREATE the table and re-run successfully, the old error rows from previous runs don't get cleaned automatically — the idempotency check (`get_already_transcribed()`) only looks at `WHERE error_message IS NULL`, so it re-transcribes error files correctly but doesn't delete the old error row. Result: 36 rows (35 success + 1 stale error). Harmless — all downstream queries filter `WHERE error_message IS NULL` — but worth noting.
 
-**Interview one-liner (new):**
+**Key takeaway:**
 - "Chirp 3 doesn't return word confidence, so any downstream filters on confidence need to handle 0.0 as 'no data available' rather than 'bad transcription.'"
 - "The first batch_recognize call takes 4-5 minutes (cold start). Subsequent calls drop to 15-30 seconds. Plan for this in pipeline timeouts."
 
@@ -226,14 +226,14 @@ The 6 department misclassifications are all genuine edge cases:
 - Two Billing calls about plan upgrades/downgrades → classified as Product. Because subscription tier changes ARE product decisions. The Billing→Support mapping is debatable here.
 - A feature report that mentions bugs → Product expected, got Engineering. Reasonable.
 
-**Interview takeaway:** In production, you'd either expand the classifier's taxonomy to match the business reality (add Billing, Logistics as separate departments) or maintain an explicit mapping with documented trade-offs. The fact that we found this gap in evaluation is exactly why you evaluate.
+**Takeaway:** In production, you'd either expand the classifier's taxonomy to match the business reality (add Billing, Logistics as separate departments) or maintain an explicit mapping with documented trade-offs. The fact that we found this gap in evaluation is exactly why you evaluate.
 
 ### What we deliberately skipped
 
-- **V1→V2→V3 prompt comparison on synthetic data.** V1 works well. The prompts are written, the methodology (version tracking via `model_version` field, structured evaluation framework) is in place. Running all three against synthetic data to produce fake improvement metrics would look good on paper but fall apart in an interview. "What was your ground truth?" is a question we'd rather answer honestly.
+- **V1→V2→V3 prompt comparison on synthetic data.** V1 works well. The prompts are written, the methodology (version tracking via `model_version` field, structured evaluation framework) is in place. Running all three against synthetic data to produce fake improvement metrics would look good on paper but fall apart under scrutiny. "What was your ground truth?" is a question worth answering honestly.
 - **100 labeled test records.** Not meaningful on synthetic text. The evaluation framework (`evaluate_call_classification.py`) works — plug in real labeled data and it runs the same way.
 
-**Interview one-liners:**
+**Key takeaways:**
 - "WER is the standard metric for STT accuracy. Ours was 4% on synthetic audio — realistic floor, not ceiling."
 - "You can't evaluate an LLM classifier on LLM-generated data. The evaluation framework matters more than fake metrics."
 - "We found a taxonomy mismatch during evaluation — 6 departments in the data, 4 in the classifier. That's the kind of thing evaluation is for."
@@ -291,7 +291,7 @@ Returns: AI summary with citations + top matching records
 
 ### Cost
 
-~$1.50 per 1,000 queries. For a portfolio demo, this is effectively free. Google also offers a $1,000 Vertex AI Search promo credit for new customers.
+~$1.50 per 1,000 queries. For a project this size, this is effectively free. Google also offers a $1,000 Vertex AI Search promo credit for new customers.
 
 The real cost to be aware of is data store indexing — when you connect BigQuery, it indexes your data. For ~1,400 records this is negligible, but on production-scale data (millions of records) it becomes a line item.
 
@@ -329,7 +329,7 @@ Vertex AI Search auto-detects your schema from BigQuery but doesn't know which f
 
 Needed to delete and recreate the data store (to fix `CONTENT_REQUIRED` → `NO_CONTENT`). Google says deletion "could take a couple of hours." Actual time: still pending after 12 hours. Fix: used new IDs (`feedback-store-v2`, `feedback-search-app-v2`) and moved on. Pragmatic.
 
-### Interview one-liners
+### Key takeaways
 
 - "Vertex AI Search is RAG-as-a-service — embeddings, indexing, retrieval, and summarization behind one API. No vector database to manage."
 - "For structured BigQuery data, use `NO_CONTENT` — not `CONTENT_REQUIRED`. The naming is counterintuitive: NO_CONTENT means 'structured fields,' not 'nothing to search.'"
@@ -429,11 +429,75 @@ We use regular views for `dashboard_view`, `call_analytics`, and `source_compari
 
 **Rule of thumb:** Regular views for small or frequently-changing data. Materialized views for expensive aggregations on large, append-mostly tables.
 
-### Interview one-liners
+### Key takeaways
 
 - "Looker Studio can't UNNEST arrays — you need a BigQuery view that CROSS JOINs the array into rows. Standard BI denormalization pattern."
 - "Regular views are free but re-scan every query. Materialized views cache results but cost storage. At 1,400 rows, regular views are the right call."
 - "The dashboard engineering isn't the charts — it's preparing BigQuery views so a drag-and-drop tool can consume complex data structures."
+
+---
+
+## Sprint 10 — React Frontend + API
+
+**What we're building:** A FastAPI backend exposing BigQuery data as REST endpoints, and a React frontend that makes the entire pipeline explorable — dashboards, transcript viewer, classification explorer, and semantic search.
+
+### The "why" — the ML engineering layer
+
+Looker covers BI stakeholders. The frontend covers the ML engineering story: "here's the pipeline health, here are the transcripts, here's how the classifier performed, here's semantic search in action." Opening a polished dashboard with real data is more convincing than describing it.
+
+### API design: thin layer over BigQuery
+
+The FastAPI backend is intentionally thin — 8 endpoints, no ORM, no database migrations. Each endpoint is a parameterized BigQuery query. Why?
+
+1. **BigQuery IS the database.** Adding Postgres or SQLite in front of it would be redundant. The data is in BigQuery, the queries run in BigQuery, the API just formats results as JSON.
+2. **Parameterized queries.** The spec example used f-string interpolation (`f"department = '{department}'"`) — classic SQL injection. We use `@param` bindings: BigQuery handles escaping. This is standard practice — always parameterize.
+3. **No caching layer.** Our data is static (1,402 records). BigQuery queries over this volume cost effectively $0 and return in <1s. Adding Redis would be over-engineering.
+
+### Frontend architecture: 4 pages, dark theme, Recharts
+
+| Page | Data Source | Purpose |
+|---|---|---|
+| Dashboard | `/stats` + `/chirp-stats` + `/departments` | Pipeline health overview, sentiment donut, department bars |
+| Transcripts | `/transcripts` + `/transcript/{id}` | Browse calls, click for full transcript + classification |
+| Explorer | `/feedback` + `/departments` | Filter by department/sentiment/source, click for detail |
+| Search | `/search` | Vertex AI Search with AI summary + results |
+
+Vite proxies `/api/*` to the FastAPI server in development — no CORS issues, no URL hardcoding.
+
+### Key takeaways
+
+- "The API is a thin layer over BigQuery — parameterized queries, no ORM, no caching. BigQuery IS the database at this scale."
+- "The spec had SQL injection in the feedback endpoint. I caught it and switched to @param bindings. That's the kind of thing code reviewers look for."
+- "FastAPI + React is the standard stack for ML engineering dashboards. The alternative is Streamlit, but that doesn't demonstrate frontend engineering."
+
+---
+
+## Sprint 11 — Documentation & Demo Prep
+
+**What we're building:** Nothing new. This sprint packages everything into clear, reproducible documentation.
+
+### The real work in Sprint 11
+
+The code is done. The engineering is done. Sprint 11 is about communication — documenting what was built, why it was built that way, and how someone else can reproduce it.
+
+Three deliverables:
+
+1. **README.md rewrite** — The original README was a work-in-progress snapshot. The final version has the full architecture (batch + streaming paths), every technology with justification, complete project structure, and a working setup guide.
+
+2. **Stakeholder_Demo_Guide.md** — A 5-minute walkthrough script for demoing the platform. Plus 12 Q&A covering architecture, AI/ML, GCP specifics, and production considerations.
+
+3. **Documentation audit** — Every sprint has a section in this file with the "why," the hiccups, and the key takeaways. Running Themes captures patterns across sprints.
+
+### What makes this a strong project
+
+| Strong | Weak |
+|---|---|
+| Documents WHY, not just what | README says "I used BigQuery" |
+| Shows prompt iteration (V1→V3) | Shows final prompt only |
+| Admits evaluation limits on synthetic data | Claims 85% accuracy without caveats |
+| Fixes spec bugs (SQL injection) | Copy-pastes spec code |
+| Has a reproducible setup script | "It works on my machine" |
+| Explains trade-offs (Chirp 2 vs 3) | Uses whatever tutorial said |
 
 ---
 
@@ -451,8 +515,9 @@ We use regular views for `dashboard_view`, `call_analytics`, and `source_compari
 - **GCP naming is counterintuitive.** `NO_CONTENT` means "structured fields" not "nothing to search." `CONTENT_REQUIRED` means "document blob" not "must have content." Read the enum values, not the names.
 - **GCP deletions are slow.** Data store deletion took 12+ hours. Don't wait — use new IDs and move on. This pattern applies to many GCP resources.
 - **BI tools can't handle raw data structures.** Arrays, nested fields, cross-table aggregations — all need pre-computed views. The engineering is in the views, not the charts.
+- **Spec code isn't production code.** The implementation plan had f-string SQL interpolation — textbook SQL injection. Always review spec code before shipping it.
 
-### Interview-ready one-liners
+### Key one-liners
 - "Gen2 Cloud Functions are Cloud Run + Eventarc + Pub/Sub. You're debugging three systems."
 - "Eventarc retries are persistent — if you fix IAM after failed deliveries, every queued retry fires at once."
 - "BigQuery streaming inserts are append-only for 30 minutes. Design around it or use batch loads."
@@ -468,3 +533,5 @@ We use regular views for `dashboard_view`, `call_analytics`, and `source_compari
 - "For structured BigQuery data use NO_CONTENT, not CONTENT_REQUIRED. The naming is backwards."
 - "Looker can't query REPEATED fields — CROSS JOIN UNNEST into a view. Standard BI denormalization."
 - "Regular views for small data, materialized views for expensive aggregations. Know the trade-off."
+- "The API is a thin BigQuery wrapper — parameterized queries, no ORM, no cache. At 1,400 rows, anything more is over-engineering."
+- "Caught SQL injection in the spec — switched to @param bindings. Always parameterize."

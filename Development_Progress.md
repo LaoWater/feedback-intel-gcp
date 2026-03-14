@@ -17,9 +17,9 @@
 | 06 | Evaluation & Iteration | ✅ COMPLETE | 2026-03-12 |
 | 07 | Vertex AI Search | ✅ COMPLETE | 2026-03-13 |
 | 08 | Apache Beam + Dataflow Pipeline | ✅ COMPLETE | 2026-03-13 |
-| 09 | Looker Dashboard | 🔄 IN PROGRESS | — |
-| 10 | React Frontend + API | ⬚ Not Started | — |
-| 11 | Polish & Interview Prep | ⬚ Not Started | — |
+| 09 | Looker Dashboard (Views) | ✅ COMPLETE | 2026-03-14 |
+| 10 | React Frontend + API | ✅ COMPLETE | 2026-03-14 |
+| 11 | Documentation & Demo Prep | 🔄 IN PROGRESS | — |
 
 ---
 
@@ -41,7 +41,7 @@
 - [x] Created service account `feedback-pipeline@` with 5 roles (bigquery.dataEditor, aiplatform.user, storage.objectAdmin, speech.client, pubsub.subscriber)
 - [x] Verified: test INSERT + SELECT on `raw_feedback` — confirmed end-to-end
 
-### Key Decisions & Interview Notes
+### Key Decisions & Notes
 - **Partitioning + Clustering**: Cost control. Partitions skip irrelevant date ranges; clustering sorts within partitions for fast filters.
 - **Separate transcript table**: `call_transcripts` preserves Chirp-specific metadata (duration, speakers, confidence) separate from the unified `enriched_feedback` table.
 - **Pub/Sub over direct trigger**: Decoupling. If Chirp is slow/down, messages queue and retry. Enables multiple subscribers later (transcription, audio QA, archiving).
@@ -239,7 +239,7 @@
 2. **Search Engine (App)** — the query interface on top of the data store.
 3. **Python query function** — `search_feedback(query, department, source)` that calls the API.
 
-**Cost:** ~$1.50 per 1,000 queries. For a portfolio demo with ~50-100 queries, this is pennies. $300 GCP credit / $1,000 Vertex AI Search promo credit covers it.
+**Cost:** ~$1.50 per 1,000 queries. For a project with ~50-100 queries, this is pennies. $300 GCP credit / $1,000 Vertex AI Search promo credit covers it.
 
 ### Completed Steps
 - [x] Discovery Engine API already enabled (Sprint 01)
@@ -383,7 +383,7 @@
 
 **Step 7: Share**
 - Click "Share" → "Get link" → "Anyone with the link can view"
-- Copy the URL — this is your portfolio demo link
+- Copy the URL — this is your shareable demo link
 
 ### Key Design Decisions
 - **Views vs direct tables** — Looker Studio can't UNNEST arrays or do complex JOINs inline. Views pre-shape the data so Looker just reads rows.
@@ -402,30 +402,82 @@
 
 **Goal:** FastAPI backend + React frontend deployed on Cloud Run.
 
-### Steps
-- [ ] Build FastAPI: `/stats`, `/chirp-stats`, `/feedback`, `/transcripts`, `/transcript/{id}`, `/search`, `/classify`
-- [ ] Build React frontend: Pipeline Dashboard, Transcript Viewer, Classification Explorer, Semantic Search
-- [ ] Dockerize API → Cloud Run
-- [ ] Deploy frontend → Firebase Hosting
+### Completed Steps
+- [x] Built FastAPI backend (`api/main.py`) — 8 endpoints: `/stats`, `/chirp-stats`, `/transcripts`, `/transcript/{id}`, `/feedback`, `/departments`, `/search`, `/health`
+- [x] Built React frontend (`frontend/`) — 4 pages: Dashboard, Transcript Viewer, Classification Explorer, Semantic Search
+- [x] Parameterized queries with `@param` (no SQL injection in `/feedback`)
+- [x] Vite dev proxy → FastAPI for local development
+- [x] Dockerfile for API deployment to Cloud Run
+- [ ] `npm install` + local test
+- [ ] Deploy API to Cloud Run
+- [ ] Deploy frontend to Firebase Hosting (or Cloud Run)
+
+### Key Decisions & Notes
+- **Parameterized queries**: `/api/feedback` uses `@param` bindings, not f-string interpolation. The spec example used f-strings — we fixed that. SQL injection is the #1 web vulnerability.
+- **CORS wide open**: `allow_origins=["*"]` for dev. In production, lock to your frontend domain.
+- **Vite proxy**: Frontend dev server proxies `/api/*` to `localhost:8000`. No CORS issues in development, no URL hardcoding.
+- **`/api/departments`**: Not in spec but needed — frontend filter dropdowns need the list dynamically. Avoids hardcoding department names.
+- **Recharts for charts**: Lightweight, React-native charting. No D3 complexity for this scope.
+
+### Architecture
+
+```
+frontend/ (React + Vite)          api/ (FastAPI)
+  ├── src/                          ├── main.py         ← 8 endpoints
+  │   ├── pages/                    ├── requirements.txt
+  │   │   ├── Dashboard.jsx         ├── Dockerfile
+  │   │   ├── Transcripts.jsx       └── (imports search/)
+  │   │   ├── Explorer.jsx
+  │   │   └── Search.jsx
+  │   ├── components/Layout.jsx
+  │   ├── api.js                 ← API client
+  │   ├── main.jsx               ← Router
+  │   └── index.css              ← Dark theme
+  ├── package.json
+  ├── vite.config.js
+  └── index.html
+```
+
+### Local Development
+
+```bash
+# Terminal 1: API
+cd api && pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+
+# Terminal 2: Frontend
+cd frontend && npm install && npm run dev
+# Opens at http://localhost:5173, proxies /api/* to :8000
+```
 
 ### Done Criteria
 - Both deployed with public URLs
 - All pages functional
-- Transcript Viewer shows diarized text with speaker colors
+- Transcript Viewer shows diarized text
 
 ---
 
-## Sprint 11 — Polish & Interview Prep
+## Sprint 11 — Documentation & Demo Prep
 
-**Goal:** README, demo recording, talking points rehearsed.
+**Goal:** Polished README, stakeholder demo guide, complete project documentation.
 
-### Steps
-- [ ] Write comprehensive README.md with architecture diagram, setup instructions, screenshots
-- [ ] Record 5-minute screen walkthrough: upload audio → Chirp → Gemini → Looker → search
-- [ ] Practice end-to-end story
-- [ ] Prepare scaling/failure-mode answers
+### Completed Steps
+- [x] Rewrote README.md — full architecture diagram (batch + streaming paths), tech stack table, project structure, setup instructions, key design decisions, lessons learned
+- [x] Created `Stakeholder_Demo_Guide.md` — 5-minute walkthrough script, 12 Q&A on architecture/design, key talking points
+- [x] All sprint documentation complete in Development_Progress.md and Documenting_Progress.md
+- [ ] Record screen demo (optional)
+
+### Project Documentation Map
+
+| Document | Purpose |
+|----------|---------|
+| `README.md` | Project overview — architecture, tech stack, setup guide |
+| `Stakeholder_Demo_Guide.md` | Walkthrough script + Q&A reference |
+| `Documenting_Progress.md` | Deep-dive on every sprint's decisions and lessons |
+| `Apache_Dataflow.MD` | Beam/Dataflow concepts and replication guide |
+| `BQ_First_Contact.md` | BigQuery guide for developers from SQL backgrounds |
 
 ### Done Criteria
-- README committed
-- Demo recorded
-- Can explain every architectural decision from memory
+- README is complete and polished
+- Demo walkthrough flows naturally
+- Every architectural decision is documented with reasoning
